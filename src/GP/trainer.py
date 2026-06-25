@@ -1,0 +1,99 @@
+import torch
+import gpytorch
+from typing import List
+
+from .components import get_optimizer, get_loss_fn
+from .config import GPConfig
+
+class GPTrainer:
+    def __init__(self, config: GPConfig):
+        self.config = config
+
+    def fit(
+        self,
+        model: gpytorch.models.GP,
+        likelihood: gpytorch.likelihoods.Likelihood,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor
+    ) -> List[float]:
+        model.train()
+        likelihood.train()
+
+        params = list(set(model.parameters()).union(set(likelihood.parameters())))
+        opt_type = self.config.training.optimizer
+        if isinstance(opt_type, str) and opt_type.lower() == "lbfgs":
+            optimizer = torch.optim.LBFGS(
+                params,
+                lr=self.config.training.lr,
+                line_search_fn="strong_wolfe"
+            )
+        else:
+            optimizer = get_optimizer(params, self.config.training)
+
+        loss_fn = get_loss_fn(model, likelihood, self.config.training, num_data=train_x.size(0))
+
+        loss_history = []
+        epochs = self.config.training.epochs
+
+        patience = self.config.training.early_stopping_patience or 15
+        best_loss = float('inf')
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            try:
+                if self.config.training.optimizer == "lbfgs":
+                    def closure():
+                        optimizer.zero_grad()
+                        output = model(train_x)
+                        loss = -loss_fn(output, train_y)
+                        loss.backward()
+                        return loss
+                    
+                    optimizer.step(closure)
+
+                    with torch.no_grad():
+                        output = model(train_x)
+                        loss = -loss_fn(output, train_y)
+
+                else:
+                    optimizer.zero_grad()
+                    output = model(train_x)
+                    loss = -loss_fn(output, train_y)
+                    loss.backward()
+                    optimizer.step()
+            except (gpytorch.utils.errors.NanError, RuntimeError) as e:
+                if self.config.training.verbose:
+                        print(f"\n[Предупреждение] Обучение остановлено из-за численной нестабильности на эпохе {epoch+1}")
+                break
+            
+            current_loss = loss.item()
+            loss_history.append(current_loss)
+
+            if self.config.training.verbose and (epoch % 10 == 0 or epoch == epochs - 1):
+                print(
+                    f"Epoch {epoch + 1:3d}/{self.config.training.epochs} | "
+                    f"Loss: {loss.item():.4f} | "
+                    f"Noise: {likelihood.noise.item():.3f}"
+                )
+                try:
+                    ls = model.covar_module.base_kernel.lengthscale.squeeze().detach().cpu().numpy()
+                    
+                    if ls.ndim == 0:
+                        print(f"Lengthscale: {ls.item():.3f}")
+                    else:
+                        ls_str = ", ".join([f"{x:.3f}" for x in ls])
+                        print(f"Lengthscales (ARD): [{ls_str}]")
+                except Exception as e:
+                    print(f"Не удалось вывести lengthscale (ошибка: {e})")
+            if current_loss < best_loss - 1e-4:
+                    best_loss = current_loss
+                    patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                if self.config.training.verbose:
+                    print(f"\n[Early Stopping] Обучение завершено на эпохе {epoch + 1}, лосс стабилизировался.")
+                break
+            
+        return loss_history
