@@ -19,16 +19,13 @@ def find_best_h_for_group(gp_model, dataset: pd.DataFrame, group_cols: list, num
     n_features = len(all_features)
     n_samples = len(dataset)
     
-    group_indices = [all_features.index(col) for col in group_cols]
-    
-    remaining_cols = [col for col in all_features if col not in group_cols]
-    
     n_points = min(num_test_points, n_samples)
     sampled_indices = np.random.choice(n_samples, n_points, replace=False)
     sampled_data = dataset.iloc[sampled_indices]
     
+    # Формируем точки, заменяя неактивные переменные медианами (отличный шаг!)
     pts = torch.tensor(dataset[all_features].values, dtype=torch.float32)[sampled_indices]
-    
+    remaining_cols = [col for col in all_features if col not in group_cols]
     for col_name in remaining_cols:
         col_idx = all_features.index(col_name)
         median_val = dataset[col_name].median()
@@ -36,78 +33,83 @@ def find_best_h_for_group(gp_model, dataset: pd.DataFrame, group_cols: list, num
         
     pts.requires_grad_(True)
     
-    # gp_model.eval()
     gp_model.model.eval()
     gp_model.likelihood.eval()
     y = gp_model.likelihood(gp_model.model(pts)).mean
     grads_all = torch.autograd.grad(y.sum(), pts)[0] 
     
-    grads_target = grads_all[:, group_indices] 
-    
-    norms_target = torch.norm(grads_target, dim=1, keepdim=True) + 1e-9
-    v_target = grads_target / norms_target
-    
     symbols = [sp.Symbol(name) for name in group_cols]
-    candidates = []
-    for s1, s2 in combinations(symbols, 2):
-        candidates.extend([
-            s1 + s2,
-            s1 - s2,
-            s1 * s2,
-            s1 / s2,
-            s1**2 + s2**2,
-            s1**2 - s2**2,
-            s1 / (s2**2 + 1e-9),
-            s2 / (s1**2 + 1e-9),
-            
-            sp.sin(s1 - s2),
-            sp.sin(s1 + s2),
-            sp.cos(s1 - s2),
-            sp.cos(s1 + s2),
-
-            s1 * sp.exp(s2),
-            s2 * sp.exp(s1),
-            s1 * sp.exp(-s2),
-            s2 * sp.exp(-s1),
-            
-            sp.sin(s1) * sp.exp(s2),
-            sp.sin(s2) * sp.exp(s1),
-            sp.sin(s1 - s2) * sp.exp(s1), # или exp(s2)
-            
-            sp.log(s1 + 1e-9) - sp.log(s2 + 1e-9),
-            sp.log(s1 + 1e-9) + sp.log(s2 + 1e-9),
-        ])
-        
+    
     best_error = 1.0
     best_candidate = None
     
-    group_data_np = sampled_data[group_cols].values
-    args = [group_data_np[:, i] for i in range(len(group_cols))]
-    
-    for h_expr in candidates:
-        grad_h_sym = [sp.diff(h_expr, sym) for sym in symbols]
+    for idx1, idx2 in combinations(range(len(group_cols)), 2):
+        col_name1, col_name2 = group_cols[idx1], group_cols[idx2]
+        s1, s2 = symbols[idx1], symbols[idx2]
         
-        grad_arrays = []
-        for g_expr in grad_h_sym:
-            f_g = sp.lambdify(symbols, g_expr, 'numpy')
-            vals = f_g(*args)
-            if isinstance(vals, (int, float, np.integer, np.floating)):
-                vals = np.full(n_points, vals)
-            grad_arrays.append(vals)
+        global_idx1 = all_features.index(col_name1)
+        global_idx2 = all_features.index(col_name2)
+        
+        grads_target_pair = grads_all[:, [global_idx1, global_idx2]]
+        norms_target_pair = torch.norm(grads_target_pair, dim=1, keepdim=True) + 1e-9
+        v_target_pair = grads_target_pair / norms_target_pair
+        
+        candidates = [
+            s1 + s2,
+            s1 - s2, 
+            s1 * s2, 
+            s1 / s2,
+
+            s1**2 + s2**2, 
+            s1**2 - s2**2,
+            s1 / (s2**2 + 1e-9), 
+            s2 / (s1**2 + 1e-9),
+
+            sp.sin(s1 - s2), 
+            sp.sin(s1 + s2), 
+            sp.cos(s1 - s2), 
+            sp.cos(s1 + s2),
+
+            s1 * sp.exp(s2), 
+            s2 * sp.exp(s1), 
+            s1 * sp.exp(-s2), 
+            s2 * sp.exp(-s1),
+
+            sp.sin(s1) * sp.exp(s2), 
+            sp.sin(s2) * sp.exp(s1), 
+            sp.sin(s1 - s2) * sp.exp(s1),
+
+            sp.log(s1 + 1e-9) - sp.log(s2 + 1e-9), 
+            sp.log(s1 + 1e-9) + sp.log(s2 + 1e-9),
+        ]
+        
+        group_data_np = sampled_data[[col_name1, col_name2]].values
+        args = [group_data_np[:, 0], group_data_np[:, 1]]
+        
+        for h_expr in candidates:
+            grad_h_sym = [sp.diff(h_expr, s1), sp.diff(h_expr, s2)]
             
-        grads_cand = np.stack(grad_arrays, axis=1)
-        grads_cand_tensor = torch.tensor(grads_cand, dtype=torch.float32)
-        
-        norms_cand = torch.norm(grads_cand_tensor, dim=1, keepdim=True) + 1e-9
-        v_cand = grads_cand_tensor / norms_cand
-        
-        cos_sim = torch.sum(v_target * v_cand, dim=1)
-        error = torch.mean(1.0 - cos_sim**2).item()
-        
-        if error < best_error:
-            best_error = error
-            best_candidate = h_expr
+            grad_arrays = []
+            for g_expr in grad_h_sym:
+                f_g = sp.lambdify([s1, s2], g_expr, 'numpy')
+                vals = f_g(*args)
+                if isinstance(vals, (int, float, np.integer, np.floating)):
+                    vals = np.full(n_points, vals)
+                grad_arrays.append(vals)
+                
+            grads_cand = np.stack(grad_arrays, axis=1)
+            grads_cand_tensor = torch.tensor(grads_cand, dtype=torch.float32)
             
+            norms_cand = torch.norm(grads_cand_tensor, dim=1, keepdim=True) + 1e-9
+            v_cand = grads_cand_tensor / norms_cand
+            
+            cos_sim = torch.sum(v_target_pair * v_cand, dim=1)
+            error = torch.mean(1.0 - cos_sim**2).item()
+            
+            if error < best_error:
+                best_error = error
+                best_candidate = h_expr
+                
     print(f"-> Лучшая найденная внутренняя функция связи: {best_candidate} (Ошибка косинуса: {best_error:.6f})")
     return best_candidate
 
@@ -163,7 +165,7 @@ def do_variable_collapse(dataset: pd.DataFrame, result, gp_model, split_type: st
             new_col_name = f"({x1_name}_div_{x2_name})"
             df_mutated[new_col_name] = df_mutated[x1_name] / (df_mutated[x2_name] + 1e-9)
             
-        elif split_type == "Product Symmetry":
+        elif split_type == "Multiply Symmetry":
             new_col_name = f"({x1_name}_mul_{x2_name})"
             df_mutated[new_col_name] = df_mutated[x1_name] * df_mutated[x2_name]
 

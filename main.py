@@ -88,8 +88,8 @@ if __name__ == "__main__":
             lr=0.02,                 
             epochs=1000,    
             early_stopping_patience=15,          
-            optimizer="lbfgs",
-            loss_type = "loo",
+            optimizer="adam",
+            loss_type = "mll",
             verbose=False     
         ),
     )
