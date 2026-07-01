@@ -7,6 +7,7 @@ simplifiers = [
     AdditiveSeparabilitySimplifier(), 
     MultiplicationSeparabilitySimplifier(),
     TranslationalSymmetrySimplifier(),
+    AdditionSymmetrySimplifier(),
     LargeScaleSymmetrySimplifier(),
     MultiplySymmetrySimplifier(),
     CompositionalitySimplifier(),
@@ -149,7 +150,7 @@ def do_task_split(dataset: pd.DataFrame, groups, gp_model, split_type: str):
 def do_variable_collapse(dataset: pd.DataFrame, result, gp_model, split_type: str):
     df_mutated = dataset.copy()
 
-    if split_type in ["Translational Symmetry", "LargeScale Symmetry", "Multiply Symmetry"]:
+    if split_type in ["Translational Symmetry", "LargeScale Symmetry", "Multiply Symmetry", "Addition Symmetry"]:
         if isinstance(result[0], list):
             group = next(g for g in result if len(g) >= 2)
         else:
@@ -160,7 +161,11 @@ def do_variable_collapse(dataset: pd.DataFrame, result, gp_model, split_type: st
         if split_type == "Translational Symmetry":
             new_col_name = f"({x1_name}_minus_{x2_name})"
             df_mutated[new_col_name] = df_mutated[x1_name] - df_mutated[x2_name]
-            
+        
+        elif split_type == "Addition Symmetry": 
+                new_col_name = f"({x1_name}_plus_{x2_name})"
+                df_mutated[new_col_name] = df_mutated[x1_name] + df_mutated[x2_name]
+
         elif split_type == "LargeScale Symmetry":
             new_col_name = f"({x1_name}_div_{x2_name})"
             df_mutated[new_col_name] = df_mutated[x1_name] / (df_mutated[x2_name] + 1e-9)

@@ -142,6 +142,39 @@ def generate_boltzmann_density_formula(n_samples: int) -> pd.DataFrame:
     df_raw.rename(columns={"n_dimensionless": "target"}, inplace=True)
     return df_raw, reg, "n", c_part, nullspace
 
+def generate_boltzmann_density_formula_with_noise(n_samples: int, noise_level: float = 0.02) -> pd.DataFrame:
+    """Сложная: Плотность газа Больцмана: n = n0 * exp(- m * g * x / E_th)"""
+    reg = PhysicalRegistry() 
+    reg.register("n", [0, -3, 0])     # Таргет (Концентрация)
+    reg.register("n0", [0, -3, 0])    # Начальная концентрация 
+    reg.register("m", [1, 0, 0])      # Масса молекулы 
+    reg.register("g", [0, 1, -2])     # Ускорение силы тяжести 
+    reg.register("x", [0, 1, 0])      # Высота 
+    reg.register("Eth", [1, 2, -2])   # Тепловая энергия (kT)
+
+    n0 = np.random.uniform(10.0, 100.0, n_samples)
+
+    m = np.random.uniform(1.0, 2.0, n_samples)
+    g = np.random.uniform(9.8, 10.0, n_samples)
+    x = np.random.uniform(0.1, 2.0, n_samples)
+    Eth = np.random.uniform(10.0, 30.0, n_samples) 
+
+    n = n0 * np.exp(- (m * g * x) / Eth)
+
+    if noise_level > 0:
+        noise = np.random.normal(0, noise_level, n_samples)
+        n = n * (1 + noise)
+        n = np.clip(n, 1e-9, None)
+
+    raw_data = {"n": n, "n0": n0, "m": m, "g": g, "x": x, "Eth": Eth}
+
+    c_part, nullspace = reg.find_all_basic_solutions_sympy("n")
+    reg.display_solutions("n", c_part, nullspace)
+
+    df_raw = pd.DataFrame(reg.transform_dataset(raw_data, "n", c_part, nullspace))
+    df_raw.rename(columns={"n_dimensionless": "target"}, inplace=True)
+    return df_raw, reg, "n", c_part, nullspace
+
 if __name__ == "__main__":
     print("\n--- ГЕНЕРАЦИЯ ДАТАСЕТОВ ДЛЯ ФИЗИЧЕСКИХ ЭКСПЕРИМЕНТОВ ---\n")
     

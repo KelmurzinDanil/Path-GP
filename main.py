@@ -73,13 +73,13 @@ def display_final_physics_formula(formula: sp.Expr, reg: PhysicalRegistry, targe
 
 if __name__ == "__main__":
 
-    df, reg, target_name, c_part, nullspace = generate_boltzmann_density_formula(1000)
+    df, reg, target_name, c_part, nullspace = generate_gravitational_attraction_in_2D_formula(1000)
 
     config = GPConfig(
         model=ModelConfig(
             mean_type="constant",
             kernel=KernelConfig(
-                type="matern_52",    
+                type="rq",    
                 scale_kernel=True,   
                 ard=True             
             )
@@ -88,7 +88,7 @@ if __name__ == "__main__":
             lr=0.02,                 
             epochs=1000,    
             early_stopping_patience=15,          
-            optimizer="adam",
+            optimizer="lbfgs",
             loss_type = "mll",
             verbose=False     
         ),

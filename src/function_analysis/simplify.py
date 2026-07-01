@@ -233,7 +233,7 @@ class GeneralAdditiveSeparabilitySimplifier(BaseSimplifier):
         def eval_fn(sample_path, pt, n_features):
             # V = H_ii / G_i
             def compute_V(x):
-                x_temp = x.xlone().required_grad_(True)
+                x_temp = x.clone().requires_grad_(True)
                 y = sample_path(x_temp)
                 G = torch.autograd.grad(y, x_temp, create_graph=True)[0]
 
@@ -248,7 +248,7 @@ class GeneralAdditiveSeparabilitySimplifier(BaseSimplifier):
             return E
 
         avg_Z_score, adj_matrix, sigma_avg, feature_names = self._compute_pathwise_z_score(
-            gp_model, dataset, self.num_test_points, self.pool_size, self.k_sigma,
+            gp_model, dataset, self.num_test_points, self.pool_size, self.k_sigma, self.num_samples,
               is_symmetry = False, evaluation_fn = eval_fn
         )
 
@@ -261,7 +261,42 @@ class GeneralAdditiveSeparabilitySimplifier(BaseSimplifier):
             matrix_name="Средний Гессиан логарифма отношений"
         )
         
+class AdditionSymmetrySimplifier(BaseSimplifier):
+    def __init__(self, k_sigma=3.0, num_test_points=10, pool_size=100, num_samples=30):
+        super().__init__("Addition Symmetry")
+        self.k_sigma = k_sigma          
+        self.num_test_points = num_test_points
+        self.pool_size = pool_size
+        self.num_samples = num_samples
 
+    def try_simplify(self, gp_model, dataset: pd.DataFrame):
+        n_features = len(dataset.columns) - 1
+        if n_features < 2:
+            return False, None
+        
+        def eval_fn(sample_path, pt, n_features):
+            pt_temp = pt.clone().requires_grad_(True)
+            y_temp = sample_path(pt_temp)
+
+            G = torch.autograd.grad(y_temp, pt_temp)[0]
+            E = G.unsqueeze(1) - G.unsqueeze(0)
+            return E
+
+        avg_Z_score, adj_matrix, sigma_avg, feature_names = self._compute_pathwise_z_score(
+            gp_model, dataset, self.num_test_points, self.pool_size, self.k_sigma, self.num_samples,
+            is_symmetry=True, evaluation_fn=eval_fn
+        )
+
+        return self._evaluate_graph_and_split(
+            matrix=avg_Z_score,
+            threshold=3.0,
+            sigma_avg=sigma_avg,
+            feature_names=feature_names,
+            adj_mat=adj_matrix,
+            is_symmetry=True,
+            matrix_name="Матрица попарных ошибок сложения"
+        )
+    
 class TranslationalSymmetrySimplifier(BaseSimplifier):
     def __init__(self, k_sigma=3.0, num_test_points=10, pool_size=100, num_samples = 30):
         super().__init__("Translational Symmetry")
@@ -396,7 +431,7 @@ class GeneralizedSymmetrySimplifier(BaseSimplifier):
         if n_features < 2:
             return False, None
         
-        test_points, base_threshold, sigma_avg, feature_names = self._get_best_points_and_threshold(
+        test_points, base_threshold, sigma_avg, y_avg, feature_names = self._get_best_points_and_threshold(
             gp_model, dataset, self.num_test_points, self.pool_size, self.k_sigma
         )
         dynamic_threshold = base_threshold
