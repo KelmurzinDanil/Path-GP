@@ -32,11 +32,9 @@ def display_pipeline_results(final_context: SymbolicRegressionContext, original_
 
 
 if __name__ == "__main__":
-    # --- ШАГ 1: ГЕНЕРАЦИЯ СЫРЫХ РАЗМЕРНЫХ ДАННЫХ (2D ТЯГОТЕНИЕ) ---
     print("Генерация физических данных...")
     n_samples = 1000
     
-    # Генерируем размерные физические величины
     G_vals = np.random.uniform(0.5, 2.0, n_samples)
     m1_vals = np.random.uniform(1.0, 10.0, n_samples)
     m2_vals = np.random.uniform(1.0, 10.0, n_samples)
@@ -45,11 +43,9 @@ if __name__ == "__main__":
     y1_vals = np.random.uniform(-5.0, -1.0, n_samples)
     y2_vals = np.random.uniform(1.0, 6.0, n_samples)
     
-    # Вычисляем силу по закону Ньютона
     r_squared = (x2_vals - x1_vals)**2 + (y2_vals - y1_vals)**2
     F_vals = (G_vals * m1_vals * m2_vals) / r_squared
 
-    # Собираем сырой размерный DataFrame
     raw_data = {
         "F": F_vals, 
         "G": G_vals, 
@@ -62,8 +58,6 @@ if __name__ == "__main__":
     }
     df_physical = pd.DataFrame(raw_data)
 
-    # --- ШАГ 2: РЕГИСТРАЦИЯ ИСХОДНЫХ РАЗМЕРНОСТЕЙ ---
-    # Создаем реестр размерностей [Масса, Длина, Время]
     original_registry = PhysicalRegistry()
     original_registry.register("F",  [1, 1, -2])   # Сила
     original_registry.register("G",  [-1, 3, -2])  # Гравитационная постоянная
@@ -80,7 +74,6 @@ if __name__ == "__main__":
         target_name="F"
     )
 
-    # --- ШАГ 4: НАСТРОЙКА КОНФИГУРАЦИИ GP ---
     gp_config = GPConfig(
         model=ModelConfig(
             mean_type="constant",

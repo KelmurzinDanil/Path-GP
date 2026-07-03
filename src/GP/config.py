@@ -54,7 +54,6 @@ class KernelConfig:
 @dataclass
 class LikelihoodConfig:
     type: LikelihoodType = "gaussian"
-    # Словарь для любых специфических параметров (например, noise_constraint, df для Student-T и т.д.)
     extra_kwargs: Dict[str, Any] = field(default_factory=dict)
     
 @dataclass
