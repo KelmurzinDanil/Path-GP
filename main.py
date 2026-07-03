@@ -1,104 +1,112 @@
-from function_analysis.recursive_apply_simplifications import recursive_solve
 from generate.generate_dataset import *
 from GP.config import GPConfig, ModelConfig, KernelConfig, TrainingConfig
 from GP.pipeline import GPRegressionPipeline
+from symbolic.sm_context import SymbolicRegressionContext, DimensionalityEvaluator
+from symbolic.pipeline_step import DimensionalAnalysisStep, GPSimplificationStep
+from get_pi_complex import PhysicalRegistry
+
 import sympy as sp
+import numpy as np
+import pandas as pd
 
-def parse_collapsed_name(name_str: str) -> sp.Expr:
-    """
-    Рекурсивно парсит имена свернутых колонок типа '((Pi_3_minus_Pi_4)_div_Pi_2)'
-    обратно в чистые математические выражения SymPy.
-    """
-    if name_str.startswith('(') and name_str.endswith(')'):
-        name_str = name_str[1:-1]
-    
-    if "_minus_" in name_str:
-        parts = name_str.split("_minus_")
-        return parse_collapsed_name(parts[0]) - parse_collapsed_name(parts[1])
-    elif "_div_" in name_str:
-        parts = name_str.split("_div_")
-        return parse_collapsed_name(parts[0]) / parse_collapsed_name(parts[1])
-    elif "_mul_" in name_str:
-        parts = name_str.split("_mul_")
-        return parse_collapsed_name(parts[0]) * parse_collapsed_name(parts[1])
-    else:
-        return sp.Symbol(name_str)
-
-def resolve_collapsed_symbols(expr: sp.Expr) -> sp.Expr:
-    """
-    Находит в выражении все свернутые символы и заменяет их на раскрытые формулы.
-    """
-    syms = expr.free_symbols
-    sub_dict = {}
-    for sym in syms:
-        if "_minus_" in sym.name or "_div_" in sym.name or "_mul_" in sym.name:
-            sub_dict[sym] = parse_collapsed_name(sym.name)
-    return expr.subs(sub_dict)
-
-def display_final_physics_formula(formula: sp.Expr, reg: PhysicalRegistry, target_name: str, 
-                                  c_particular: sp.Matrix, nullspace_vectors: list[sp.Matrix]):
-    """
-    Выводит два красивых варианта формулы: безразмерный (якорь + Phi) и полностью раскрытый физический.
-    """
-    names = [name for name in reg.get_all_variables() if name != target_name]
-    
-    resolved_formula = resolve_collapsed_symbols(formula)
-
-    anchor_expr = reg.vector_to_formula(c_particular, names)
-    
-    pi_subs = {}
-    for i, vec in enumerate(nullspace_vectors, start=1):
-        pi_subs[sp.Symbol(f"Pi_{i}")] = reg.vector_to_formula(vec, names)
-        
+def display_pipeline_results(final_context: SymbolicRegressionContext, original_target_name: str):
     print("\n" + "="*60)
+    print("ВЫВОД ИТОГОВЫХ РЕЗУЛЬТАТОВ ПАЙПЛАЙНА")
+    print("="*60)
 
-    print("\n1. В безразмерных П-комплексах (Пи-группах):")
-    anchor_str = reg.format_expr_inline(anchor_expr)
-    resolved_formula_str = reg.format_expr_inline(resolved_formula)
-    print(f"   {target_name} = {anchor_str} · {resolved_formula_str}")
+    gp_formula = final_context.target_expr
+    print(f"\n1. Безразмерная зависимость (в терминах Пи-групп):")
+    print(f"   target_dimensionless = {gp_formula}")
 
-    print("\n2. Полное раскрытие через исходные физические переменные:")
+    print(f"\n2. Раскрытие Пи-комплексов через исходные физические переменные:")
+    for pi_name, original_expr in final_context.symbolic_mapping.items():
+        print(f"   {pi_name} = {original_expr}")
     
-    physical_inner_expr = resolved_formula.subs(pi_subs)
-    
-    full_physical_expr = anchor_expr * physical_inner_expr
-    
-    simplified_physical_expr = sp.simplify(full_physical_expr)
-    
-    final_physics_str = reg.format_expr_inline(simplified_physical_expr)
-    print(f"   {target_name} = {final_physics_str}")
+    resolved_inner_formula = gp_formula.subs(final_context.symbolic_mapping)
+    original_target_symbol = sp.Symbol(original_target_name)
+
+    print(f"\n3. Итоговое физическое уравнение:")
+    full_physics_expr = sp.simplify(resolved_inner_formula)
+    print(f"   {original_target_name} = {full_physics_expr} · [Размерный Якорь]")
     print("\n" + "="*60 + "\n")
 
 
-
 if __name__ == "__main__":
+    # --- ШАГ 1: ГЕНЕРАЦИЯ СЫРЫХ РАЗМЕРНЫХ ДАННЫХ (2D ТЯГОТЕНИЕ) ---
+    print("Генерация физических данных...")
+    n_samples = 1000
+    
+    # Генерируем размерные физические величины
+    G_vals = np.random.uniform(0.5, 2.0, n_samples)
+    m1_vals = np.random.uniform(1.0, 10.0, n_samples)
+    m2_vals = np.random.uniform(1.0, 10.0, n_samples)
+    x1_vals = np.random.uniform(-5.0, -1.0, n_samples)
+    x2_vals = np.random.uniform(1.0, 6.0, n_samples)
+    y1_vals = np.random.uniform(-5.0, -1.0, n_samples)
+    y2_vals = np.random.uniform(1.0, 6.0, n_samples)
+    
+    # Вычисляем силу по закону Ньютона
+    r_squared = (x2_vals - x1_vals)**2 + (y2_vals - y1_vals)**2
+    F_vals = (G_vals * m1_vals * m2_vals) / r_squared
 
-    df, reg, target_name, c_part, nullspace = generate_gravitational_attraction_in_2D_formula(1000)
+    # Собираем сырой размерный DataFrame
+    raw_data = {
+        "F": F_vals, 
+        "G": G_vals, 
+        "m1": m1_vals, 
+        "m2": m2_vals, 
+        "x1": x1_vals, 
+        "x2": x2_vals, 
+        "y1": y1_vals, 
+        "y2": y2_vals
+    }
+    df_physical = pd.DataFrame(raw_data)
 
-    config = GPConfig(
+    # --- ШАГ 2: РЕГИСТРАЦИЯ ИСХОДНЫХ РАЗМЕРНОСТЕЙ ---
+    # Создаем реестр размерностей [Масса, Длина, Время]
+    original_registry = PhysicalRegistry()
+    original_registry.register("F",  [1, 1, -2])   # Сила
+    original_registry.register("G",  [-1, 3, -2])  # Гравитационная постоянная
+    original_registry.register("m1", [1, 0, 0])    # Масса 1
+    original_registry.register("m2", [1, 0, 0])    # Масса 2
+    original_registry.register("x1", [0, 1, 0])    # Координаты
+    original_registry.register("x2", [0, 1, 0])
+    original_registry.register("y1", [0, 1, 0])
+    original_registry.register("y2", [0, 1, 0])
+
+    context = SymbolicRegressionContext.create_initial_context(
+        df=df_physical,
+        registry=original_registry,
+        target_name="F"
+    )
+
+    # --- ШАГ 4: НАСТРОЙКА КОНФИГУРАЦИИ GP ---
+    gp_config = GPConfig(
         model=ModelConfig(
             mean_type="constant",
             kernel=KernelConfig(
-                type="rq",    
+                type="matern_52",    
                 scale_kernel=True,   
                 ard=True             
             )
         ),
         training=TrainingConfig(
             lr=0.02,                 
-            epochs=1000,    
+            epochs=1000,  
             early_stopping_patience=15,          
             optimizer="lbfgs",
-            loss_type = "mll",
+            loss_type="mll",
             verbose=False     
         ),
     )
-    formula = recursive_solve(df, config)
 
-    display_final_physics_formula(
-        formula=formula,
-        reg=reg,
-        target_name=target_name,
-        c_particular=c_part,
-        nullspace_vectors=nullspace
-    )
+    pipeline = [
+        DimensionalAnalysisStep(verbose=True),
+        GPSimplificationStep(gp_config=gp_config, verbose=True)
+    ]
+
+    print("\nЗапуск пайплайна обработки...")
+    for step in pipeline:
+        context = step.transform(context)
+
+    display_pipeline_results(context, original_target_name="F")
