@@ -36,10 +36,11 @@ class BaseSimplifier(ABC):
         return mask
 
 
-    def _get_best_points_and_threshold(self, gp_model, dataset: pd.DataFrame, 
+    def _get_best_points_and_threshold(self, gp_model, context: 'SymbolicRegressionContext',
                                        num_test_points: int, pool_size: int, k_sigma: float):
-        
-        feature_names = [col for col in dataset.columns if col != 'target']
+        dataset = context.df
+        target_name = context.target_name
+        feature_names = [col for col in dataset.columns if col != target_name]
         n_features = len(feature_names)
         
         X_tensor = torch.tensor(dataset[feature_names].values, dtype=torch.float32)
@@ -75,7 +76,7 @@ class BaseSimplifier(ABC):
                                   num_samples: int, is_symmetry: bool, evaluation_fn, dim_mask: np.ndarray = None) -> tuple:
         dataset = context.df
         test_points, _, sigma_avg, _, feature_names = self._get_best_points_and_threshold(
-            gp_model, dataset, num_test_points, pool_size, k_sigma
+            gp_model, context, num_test_points, pool_size, k_sigma
         )
         n_features = len(feature_names)
 
@@ -602,7 +603,7 @@ class GeneralizedSymmetrySimplifier(BaseSimplifier):
             return False, None
         
         test_points, base_threshold, sigma_avg, y_avg, feature_names = self._get_best_points_and_threshold(
-            gp_model, context.df, self.num_test_points, self.pool_size, self.k_sigma
+            gp_model, context, self.num_test_points, self.pool_size, self.k_sigma
         )
         dynamic_threshold = base_threshold
 

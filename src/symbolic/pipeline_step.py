@@ -300,15 +300,14 @@ class GPSimplificationStep(PipelineStep):
         else:
             raise ValueError(f"Неизвестный тип склейки: {split_type}")
     
-    def train_gp(self, dataset: pd.DataFrame, config: GPConfig) -> GPRegressionPipeline:
+    def train_gp(self, dataset: pd.DataFrame, target_name: str, config: GPConfig) -> GPRegressionPipeline:
         """
-        Обучает ваш собственный GPRegressionPipeline на текущем датасете.
+        Обучает GPRegressionPipeline на текущем датасете.
         """
-        feature_cols = [col for col in dataset.columns if col != 'target']
-        n_features = len(feature_cols)
+        feature_cols = [col for col in dataset.columns if col != target_name]
         
         train_x = torch.tensor(dataset[feature_cols].values, dtype=torch.float32)
-        train_y = torch.tensor(dataset['target'].values, dtype=torch.float32)
+        train_y = torch.tensor(dataset[target_name].values, dtype=torch.float32)
         
         pipeline = GPRegressionPipeline(config)
         pipeline.fit(train_x, train_y)
@@ -363,7 +362,7 @@ class GPSimplificationStep(PipelineStep):
         if self.verbose:
             print(f"\n--- [Глубина {current_depth}] Обучение GP для переменных: {feature_names} ---")
 
-        gp_model = self.train_gp(context.df, self.gp_config)
+        gp_model = self.train_gp(context.df, context.target_name, self.gp_config)
         for simplifier in simplifiers:
             success, result = simplifier.try_simplify(gp_model, context)
             if success:
@@ -487,8 +486,10 @@ class GPSimplificationStep(PipelineStep):
         group_B = []
         for g in groups[1:]:
             group_B.extend(g)
+        
+        target_name = context.target_name
 
-        y_original = context.df['target'].values
+        y_original = context.df[target_name].values
         n_samples = len(context.df)
 
         pts_A = torch.tensor(context.df[feature_cols].values, dtype=torch.float32)
@@ -507,47 +508,47 @@ class GPSimplificationStep(PipelineStep):
 
         if is_gas:
             registry_temp = PhysicalRegistry()
-            registry_temp.register("target", context.registry.get_dim(context.target_name).vector)
+            registry_temp.register(target_name, context.registry.get_dim(target_name).vector)
             new_target_dim = DimensionalityEvaluator.evaluate(g_inv_expr, registry_temp)
         else:
-            new_target_dim = context.registry.get_dim(context.target_name)
+            new_target_dim = context.registry.get_dim(target_name)
 
             
         df_A = context.df[group_A].copy()
         if is_gas:
-            target_sym = sp.Symbol("target")
+            target_sym = sp.Symbol(target_name)
             f_g_inv = sp.lambdify([target_sym], g_inv_expr, 'numpy')
-            df_A['target'] = f_g_inv(y_A)
+            df_A[target_name] = f_g_inv(y_A)
         else:
-            df_A['target'] = y_A
+            df_A[target_name] = y_A
 
         registry_A = PhysicalRegistry()
-        registry_A.register("target", new_target_dim.vector)
+        registry_A.register(target_name, new_target_dim.vector)
 
         for col in group_A:
             registry_A.register(col, context.registry.get_dim(col).vector)
 
         mapping_A = {col: context.symbolic_mapping[col] for col in group_A}
-        context_A = SymbolicRegressionContext(df_A, registry_A, "target", mapping_A, context.target_expr)
+        context_A = SymbolicRegressionContext(df_A, registry_A, target_name, mapping_A, context.target_expr)
 
         df_B = context.df[group_B].copy()
         if is_gas:
-            target_sym = sp.Symbol("target")
+            target_sym = sp.Symbol(target_name)
             f_g_inv = sp.lambdify([target_sym], g_inv_expr, 'numpy')
-            df_B['target'] = f_g_inv(y_original) - f_g_inv(y_A)
+            df_B[target_name] = f_g_inv(y_original) - f_g_inv(y_A)
         elif split_type in ["Additive Separability"]:
-            df_B['target'] = y_original - y_A
+            df_B[target_name] = y_original - y_A
         elif split_type == "Multiplicative Separability":
             y_A_safe = np.copysign(np.maximum(np.abs(y_A), 1e-4), y_A)
-            df_B['target'] = np.clip(y_original / y_A_safe, -1e5, 1e5)
+            df_B[target_name] = np.clip(y_original / y_A_safe, -1e5, 1e5)
 
         registry_B = PhysicalRegistry()
-        registry_B.register("target", context.registry.get_dim(context.target_name).vector)
+        registry_B.register(target_name, context.registry.get_dim(target_name).vector)
         for col in group_B:
             registry_B.register(col, context.registry.get_dim(col).vector)
 
         mapping_B = {col: context.symbolic_mapping[col] for col in group_B}
-        context_B = SymbolicRegressionContext(df_B, registry_B, "target", mapping_B, context.target_expr)
+        context_B = SymbolicRegressionContext(df_B, registry_B, target_name, mapping_B, context.target_expr)
 
         return context_A, context_B
         

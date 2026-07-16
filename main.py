@@ -102,7 +102,7 @@ if __name__ == "__main__":
     )
 
     pipeline = [
-        DimensionalAnalysisStep(verbose=True),
+        # DimensionalAnalysisStep(verbose=True),
         GPSimplificationStep(gp_config=gp_config, verbose=True)
     ]
 
