@@ -9,6 +9,14 @@ import sympy as sp
 import numpy as np
 import pandas as pd
 
+
+import warnings
+try:
+    from linear_operator.utils.warnings import NumericalWarning
+    warnings.simplefilter("ignore", NumericalWarning)
+except ImportError:
+    pass
+
 def display_pipeline_results(final_context: SymbolicRegressionContext, original_target_name: str):
     print("\n" + "="*60)
     print("ВЫВОД ИТОГОВЫХ РЕЗУЛЬТАТОВ ПАЙПЛАЙНА")
@@ -78,16 +86,16 @@ if __name__ == "__main__":
         model=ModelConfig(
             mean_type="constant",
             kernel=KernelConfig(
-                type="matern_52",    
+                type="rq",    
                 scale_kernel=True,   
                 ard=True             
             )
         ),
         training=TrainingConfig(
             lr=0.02,                 
-            epochs=1000,  
+            epochs=5000,  
             early_stopping_patience=15,          
-            optimizer="lbfgs",
+            optimizer="adam",
             loss_type="mll",
             verbose=False     
         ),

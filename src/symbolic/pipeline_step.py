@@ -10,7 +10,7 @@ from get_pi_complex import DimensionalError, PhysicalRegistry
 from GP.config import GPConfig, ModelConfig, KernelConfig, TrainingConfig
 from GP.pipeline import GPRegressionPipeline
 from function_analysis.simplify import *
-
+from function_analysis.py_brute_force import BruteForceRunner
 simplifiers = [
     AdditiveSeparabilitySimplifier(), 
     MultiplicationSeparabilitySimplifier(),
@@ -23,104 +23,62 @@ simplifiers = [
     GeneralAdditiveSeparabilitySimplifier()
 ]
 
-def find_best_h_for_group(gp_model, dataset: pd.DataFrame, group_cols: list, num_test_points=100) -> sp.Expr:
-    all_features = [col for col in dataset.columns if col != 'target']
+def find_best_h_for_group(gp_model, context: 'SymbolicRegressionContext', group_cols: list, num_test_points=100) -> sp.Expr:
+    all_features = context.get_active_features()
     n_features = len(all_features)
-    n_samples = len(dataset)
-    
-    n_points = min(num_test_points, n_samples)
-    sampled_indices = np.random.choice(n_samples, n_points, replace=False)
-    sampled_data = dataset.iloc[sampled_indices]
-    
-    # Формируем точки, заменяя неактивные переменные медианами (отличный шаг!)
-    pts = torch.tensor(dataset[all_features].values, dtype=torch.float32)[sampled_indices]
-    remaining_cols = [col for col in all_features if col not in group_cols]
-    for col_name in remaining_cols:
-        col_idx = all_features.index(col_name)
-        median_val = dataset[col_name].median()
-        pts[:, col_idx] = median_val 
-        
-    pts.requires_grad_(True)
-    
+
+    pts_slice = torch.zeros((num_test_points, n_features), dtype=torch.float32)
+    df_slice_data = {}
+
+    for col_idx, col_name in enumerate(all_features):
+        col_vals = context.df[col_name].values
+        if col_name in group_cols:
+            grid_vals = np.random.uniform(np.min(col_vals), np.max(col_vals), num_test_points)
+            pts_slice[:, col_idx] = torch.tensor(grid_vals, dtype=torch.float32)
+            df_slice_data[col_name] = grid_vals
+
+        else:
+            median_val = context.df[col_name].median()
+            pts_slice[:, col_idx] = torch.full((num_test_points,), median_val, dtype = torch.float32)
+
     gp_model.model.eval()
     gp_model.likelihood.eval()
-    y = gp_model.likelihood(gp_model.model(pts)).mean
-    grads_all = torch.autograd.grad(y.sum(), pts)[0] 
+    with torch.no_grad():
+        predictions = gp_model.predict(pts_slice)
+        Y_slice = predictions.mean.numpy()
     
-    symbols = [sp.Symbol(name) for name in group_cols]
+    df_slice_data["target"] = Y_slice
+    df_slice = pd.DataFrame(df_slice_data)
+
+    registry_slice = PhysicalRegistry()
+    registry_slice.register("target", context.registry.get_dim(context.target_name).vector)    
     
-    best_error = 1.0
-    best_candidate = None
+    mapping_slice = {}
+    for col_name in group_cols:
+        registry_slice.register(col_name, context.registry.get_dim(col_name).vector)
+        mapping_slice[col_name] = sp.Symbol(col_name)
+
+    slice_context = SymbolicRegressionContext(
+        df=df_slice,
+        registry=registry_slice,
+        target_name="target",
+        symbolic_mapping=mapping_slice,
+        target_expr=sp.Symbol("target")
+    )
+
+    runner = BruteForceRunner(max_length=6)
+
+    print(f"[Generalized Symmetry] Запуск C++ brute-force для группы {group_cols}...")
+    h_expr, best_mse = runner.run(slice_context, optimize_constants=False)
+
+    if h_expr is not None:
+        print(f"-> Найдена многомерная внутренняя функция связи: {h_expr} (MSE на срезе: {best_mse:.6e})")
+        return h_expr
+    else:
+        # Если перебор не дал результатов, возвращаем стандартное линейное сложение как базовый сценарий
+        print("[Generalized Symmetry] Brute-force не нашел явного выражения. Откат к сумме.")
+        return sum(sp.Symbol(name) for name in group_cols)
     
-    for idx1, idx2 in combinations(range(len(group_cols)), 2):
-        col_name1, col_name2 = group_cols[idx1], group_cols[idx2]
-        s1, s2 = symbols[idx1], symbols[idx2]
-        
-        global_idx1 = all_features.index(col_name1)
-        global_idx2 = all_features.index(col_name2)
-        
-        grads_target_pair = grads_all[:, [global_idx1, global_idx2]]
-        norms_target_pair = torch.norm(grads_target_pair, dim=1, keepdim=True) + 1e-9
-        v_target_pair = grads_target_pair / norms_target_pair
-        
-        candidates = [
-            s1 + s2,
-            s1 - s2, 
-            s1 * s2, 
-            s1 / s2,
-
-            s1**2 + s2**2, 
-            s1**2 - s2**2,
-            s1 / (s2**2 + 1e-9), 
-            s2 / (s1**2 + 1e-9),
-
-            sp.sin(s1 - s2), 
-            sp.sin(s1 + s2), 
-            sp.cos(s1 - s2), 
-            sp.cos(s1 + s2),
-
-            s1 * sp.exp(s2), 
-            s2 * sp.exp(s1), 
-            s1 * sp.exp(-s2), 
-            s2 * sp.exp(-s1),
-
-            sp.sin(s1) * sp.exp(s2), 
-            sp.sin(s2) * sp.exp(s1), 
-            sp.sin(s1 - s2) * sp.exp(s1),
-
-            sp.log(s1 + 1e-9) - sp.log(s2 + 1e-9), 
-            sp.log(s1 + 1e-9) + sp.log(s2 + 1e-9),
-        ]
-        
-        group_data_np = sampled_data[[col_name1, col_name2]].values
-        args = [group_data_np[:, 0], group_data_np[:, 1]]
-        
-        for h_expr in candidates:
-            grad_h_sym = [sp.diff(h_expr, s1), sp.diff(h_expr, s2)]
-            
-            grad_arrays = []
-            for g_expr in grad_h_sym:
-                f_g = sp.lambdify([s1, s2], g_expr, 'numpy')
-                vals = f_g(*args)
-                if isinstance(vals, (int, float, np.integer, np.floating)):
-                    vals = np.full(n_points, vals)
-                grad_arrays.append(vals)
-                
-            grads_cand = np.stack(grad_arrays, axis=1)
-            grads_cand_tensor = torch.tensor(grads_cand, dtype=torch.float32)
-            
-            norms_cand = torch.norm(grads_cand_tensor, dim=1, keepdim=True) + 1e-9
-            v_cand = grads_cand_tensor / norms_cand
-            
-            cos_sim = torch.sum(v_target_pair * v_cand, dim=1)
-            error = torch.mean(1.0 - cos_sim**2).item()
-            
-            if error < best_error:
-                best_error = error
-                best_candidate = h_expr
-                
-    print(f"-> Лучшая найденная внутренняя функция связи: {best_candidate} (Ошибка косинуса: {best_error:.6f})")
-    return best_candidate
 
 class PipelineStep(ABC):
     @abstractmethod
@@ -272,21 +230,24 @@ class DimensionalAnalysisStep(PipelineStep):
 
 
 class GPSimplificationStep(PipelineStep):
-    def __init__(self, gp_config: 'GPConfig', max_depth: int = None, verbose: bool = True):
+    def __init__(self, gp_config: 'GPConfig', max_depth: int = None, bf_max_length: int = 8, verbose: bool = True):
         self.gp_config = gp_config
         self.max_depth = max_depth
+        self.bf_max_length = bf_max_length
         self.verbose = verbose
 
     def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
         if self.verbose:
             print("\n" + "="*60)
-            print("ЗАПУСК: Шаг GP декомпозиции")
+            print("[GPSimplificationStep][ЗАПУСК] Шаг GP декомпозиции")
             print(f"Активные переменные на входе: {context.get_active_features()}")
             print("="*60)
         
         working_context = context.copy()
-        final_formula = self._recursive_solve(working_context, current_depth=0)
 
+        import gpytorch
+        with gpytorch.settings.fast_computations(solves=False, log_prob=False), gpytorch.settings.cholesky_jitter(1e-3):
+            final_formula = self._recursive_solve(working_context, current_depth=0)
         resolved_formula = final_formula.subs(context.symbolic_mapping)
 
         new_context = context.copy()
@@ -305,13 +266,36 @@ class GPSimplificationStep(PipelineStep):
         expr_A = sp.sympify(formula_A)
         expr_B = sp.sympify(formula_B)
         
-        if split_type == "Additive Separability" or split_type == "General Additive Separability":
-            # f = g(A) + h(B)
-            return expr_A + expr_B
+        sum_expr = expr_A + expr_B
+        
+        if split_type == "Additive Separability":
+            return sum_expr
             
         elif split_type == "Multiplicative Separability":
-            # f = g(A) * h(B)
             return expr_A * expr_B
+            
+        elif split_type == "General Additive (Linear)":
+            return sum_expr
+            
+        elif split_type == "General Additive (Log)":
+            # g(z) = exp(z)
+            return sp.exp(sum_expr)
+            
+        elif split_type == "General Additive (Sqrt)":
+            # g(z) = z^2
+            return sum_expr**2
+            
+        elif split_type == "General Additive (Square)":
+            # g(z) = sqrt(z)
+            return sp.sqrt(sum_expr)
+            
+        elif split_type == "General Additive (Sin)":
+            # g(z) = sin(z)
+            return sp.sin(sum_expr)
+            
+        elif split_type == "General Additive (Tan)":
+            # g(z) = tan(z)
+            return sp.tan(sum_expr)
             
         else:
             raise ValueError(f"Неизвестный тип склейки: {split_type}")
@@ -333,13 +317,36 @@ class GPSimplificationStep(PipelineStep):
 
     def _brute_force_symbolic_search(self, context: 'SymbolicRegressionContext') -> sp.Expr:
         feature_names = context.get_active_features()
+
+        n_vars = len(feature_names)
+        if n_vars == 1:
+            run_length = min(self.bf_max_length, 5)
+        elif n_vars == 2:
+            run_length = min(self.bf_max_length, 6)
+        else:
+            run_length = min(self.bf_max_length, 5)
+
+        runner = BruteForceRunner(max_length=run_length)
+        if self.verbose:
+            print(f"[GPSimplificationStep][BF Search] Запуск brute-force для {feature_names} (Адаптивная длина: {run_length})...")
+
+        best_expr, best_mse = runner.run(context)
+        if best_expr is not None:
+            if self.verbose:
+                print(f"[BF Search] Найдено явное выражение: {best_expr} (MSE: {best_mse:.6e})")
+            return best_expr
+        
+        if self.verbose:
+            print("[BF Search] Корректных формул не найдено. Возврат символьной заглушки.")
+        
         if len(feature_names) == 1:
             x_name = feature_names[0]
             phi = sp.Function(f"Phi_{x_name}")
             return phi(sp.Symbol(x_name))
         else:
-            phi = sp.Function("Phi_multivariate")
+            phi = sp.Function("Phi_remaining")
             return phi(*[sp.Symbol(name) for name in feature_names])
+        
         
     def _recursive_solve(self, context: 'SymbolicRegressionContext', current_depth: int) -> sp.Expr:
         feature_names = context.get_active_features()
@@ -358,20 +365,40 @@ class GPSimplificationStep(PipelineStep):
 
         gp_model = self.train_gp(context.df, self.gp_config)
         for simplifier in simplifiers:
-            success, result = simplifier.try_simplify(gp_model, context.df)
+            success, result = simplifier.try_simplify(gp_model, context)
             if success:
                 if self.verbose:
                     print(f"[Сработало упрощение]: {simplifier.name} -> {result}")
                 if simplifier.name in ["Additive Separability", "Multiplicative Separability", "General Additive Separability"]:
-                    context_A, context_B = self._split_context(context, result, gp_model, simplifier.name)
+                    if simplifier.name == "General Additive Separability":
+                        groups, g_inv, trans_type = result
+                        mapping = {
+                            "linear": "General Additive (Linear)",
+                            "log": "General Additive (Log)",
+                            "pow_2": "General Additive (Sqrt)",
+                            "pow_half": "General Additive (Square)",
+                            "sin": "General Additive (Sin)",
+                            "tan": "General Additive (Tan)"
+                        }
+                        split_name = mapping.get(trans_type, "General Additive (Linear)")
+                        split_res = (groups, g_inv)
+                    else:
+                        split_name = simplifier.name
+                        split_res = result
+
+                    context_A, context_B = self._split_context(context, split_res, gp_model, split_name)
 
                     formula_A = self._recursive_solve(context_A, current_depth + 1)
                     formula_B = self._recursive_solve(context_B, current_depth + 1)
                     
-                    return self.combine_formulas(formula_A, formula_B, split_type=simplifier.name)
+                    return self.combine_formulas(formula_A, formula_B, split_type=split_name)
                 else:
                     mutated_context = self._collapse_context_variables(context, result, simplifier.name, gp_model)
                     return self._recursive_solve(mutated_context, current_depth + 1)
+        
+        if self.verbose:
+            print(f"[Рекурсия] Упрощения не найдены. Запуск brute-force для: {feature_names}")
+        return self._brute_force_symbolic_search(context)
 
     def _collapse_context_variables(
         self, 
@@ -434,7 +461,9 @@ class GPSimplificationStep(PipelineStep):
             group = result 
             if self.verbose:
                 print(f"Запуск локального поиска формулы связи для группы {group}...")
-            h_expr = find_best_h_for_group(gp_model, context.df, group) 
+            
+            h_expr = find_best_h_for_group(gp_model, context, group) 
+            
             return self._collapse_context_variables(context, h_expr, "Compositionality", gp_model)
 
         return new_context
@@ -449,6 +478,11 @@ class GPSimplificationStep(PipelineStep):
     ) -> Tuple['SymbolicRegressionContext', 'SymbolicRegressionContext']:
         """Разбивает контекст на два независимых подконтекста для параллельного решения."""
         feature_cols = context.get_active_features()
+
+        is_gas = split_type.startswith("General Additive")
+        if is_gas:
+            groups, g_inv_expr = groups
+
         group_A = groups[0]
         group_B = []
         for g in groups[1:]:
@@ -470,10 +504,25 @@ class GPSimplificationStep(PipelineStep):
             predictions = gp_model.predict(pts_A)
             y_A = predictions.mean.numpy()
 
+
+        if is_gas:
+            registry_temp = PhysicalRegistry()
+            registry_temp.register("target", context.registry.get_dim(context.target_name).vector)
+            new_target_dim = DimensionalityEvaluator.evaluate(g_inv_expr, registry_temp)
+        else:
+            new_target_dim = context.registry.get_dim(context.target_name)
+
+            
         df_A = context.df[group_A].copy()
-        df_A['target'] = y_A
+        if is_gas:
+            target_sym = sp.Symbol("target")
+            f_g_inv = sp.lambdify([target_sym], g_inv_expr, 'numpy')
+            df_A['target'] = f_g_inv(y_A)
+        else:
+            df_A['target'] = y_A
+
         registry_A = PhysicalRegistry()
-        registry_A.register("target", context.registry.get_dim(context.target_name).vector)
+        registry_A.register("target", new_target_dim.vector)
 
         for col in group_A:
             registry_A.register(col, context.registry.get_dim(col).vector)
@@ -482,11 +531,14 @@ class GPSimplificationStep(PipelineStep):
         context_A = SymbolicRegressionContext(df_A, registry_A, "target", mapping_A, context.target_expr)
 
         df_B = context.df[group_B].copy()
-        if split_type in ["Additive Separability", "General Additive Separability"]:
+        if is_gas:
+            target_sym = sp.Symbol("target")
+            f_g_inv = sp.lambdify([target_sym], g_inv_expr, 'numpy')
+            df_B['target'] = f_g_inv(y_original) - f_g_inv(y_A)
+        elif split_type in ["Additive Separability"]:
             df_B['target'] = y_original - y_A
         elif split_type == "Multiplicative Separability":
             y_A_safe = np.copysign(np.maximum(np.abs(y_A), 1e-4), y_A)
-    
             df_B['target'] = np.clip(y_original / y_A_safe, -1e5, 1e5)
 
         registry_B = PhysicalRegistry()
