@@ -23,7 +23,9 @@ simplifiers = [
     GeneralAdditiveSeparabilitySimplifier()
 ]
 
-def find_best_h_for_group(gp_model, context: 'SymbolicRegressionContext', group_cols: list, num_test_points=100) -> sp.Expr:
+def find_best_h_for_group(gp_model, context: 'SymbolicRegressionContext', group_cols: list, num_test_points=100,
+                          optimize_constants=True, allowed_constants=[1.0, 2.0],
+                          allowed_ops=["add", "sub", "mul", "div", "sin", "cos", "exp", "log"]) -> sp.Expr:
     all_features = context.get_active_features()
     n_features = len(all_features)
 
@@ -66,10 +68,15 @@ def find_best_h_for_group(gp_model, context: 'SymbolicRegressionContext', group_
         target_expr=sp.Symbol("target")
     )
 
-    runner = BruteForceRunner(max_length=6)
+    runner = BruteForceRunner(
+        max_length=6, 
+        optimize_constants=optimize_constants, 
+        allowed_constants=allowed_constants,
+        allowed_ops=allowed_ops
+    )
 
     print(f"[Generalized Symmetry] Запуск C++ brute-force для группы {group_cols}...")
-    h_expr, best_mse = runner.run(slice_context, optimize_constants=False)
+    h_expr, best_mse = runner.run(slice_context)
 
     if h_expr is not None:
         print(f"-> Найдена многомерная внутренняя функция связи: {h_expr} (MSE на срезе: {best_mse:.6e})")
@@ -230,11 +237,16 @@ class DimensionalAnalysisStep(PipelineStep):
 
 
 class GPSimplificationStep(PipelineStep):
-    def __init__(self, gp_config: 'GPConfig', max_depth: int = None, bf_max_length: int = 8, verbose: bool = True):
+    def __init__(self, gp_config: 'GPConfig', max_depth: int = None, bf_max_length: int = 8, verbose: bool = True,
+                 optimize_constants: bool = True, allowed_constants: list = [1.0, 2.0],
+                 allowed_ops: list = ["add", "sub", "mul", "div", "sin", "cos", "exp", "log"]):
         self.gp_config = gp_config
         self.max_depth = max_depth
         self.bf_max_length = bf_max_length
         self.verbose = verbose
+        self.optimize_constants = optimize_constants
+        self.allowed_constants = allowed_constants
+        self.allowed_ops = allowed_ops
 
     def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
         if self.verbose:
@@ -325,7 +337,13 @@ class GPSimplificationStep(PipelineStep):
         else:
             run_length = min(self.bf_max_length, 5)
 
-        runner = BruteForceRunner(max_length=run_length)
+        runner = BruteForceRunner(
+            max_length=run_length,
+            optimize_constants=self.optimize_constants,
+            allowed_constants=self.allowed_constants,
+            allowed_ops= self.allowed_ops
+        )
+
         if self.verbose:
             print(f"[GPSimplificationStep][BF Search] Запуск brute-force для {feature_names} (Адаптивная длина: {run_length})...")
 
@@ -362,8 +380,28 @@ class GPSimplificationStep(PipelineStep):
         if self.verbose:
             print(f"\n--- [Глубина {current_depth}] Обучение GP для переменных: {feature_names} ---")
 
+        active_simplifiers = [
+            AdditiveSeparabilitySimplifier(), 
+            MultiplicationSeparabilitySimplifier(),
+            TranslationalSymmetrySimplifier(),
+            AdditionSymmetrySimplifier(),
+            LargeScaleSymmetrySimplifier(),
+            MultiplySymmetrySimplifier(),
+            CompositionalitySimplifier(
+                optimize_constants=self.optimize_constants, 
+                allowed_constants=self.allowed_constants,
+                allowed_ops=self.allowed_ops
+            ),
+            GeneralizedSymmetrySimplifier(),
+            GeneralAdditiveSeparabilitySimplifier(
+                optimize_constants=self.optimize_constants, 
+                allowed_constants=self.allowed_constants,
+                allowed_ops=self.allowed_ops
+            )
+        ]
+
         gp_model = self.train_gp(context.df, context.target_name, self.gp_config)
-        for simplifier in simplifiers:
+        for simplifier in active_simplifiers:
             success, result = simplifier.try_simplify(gp_model, context)
             if success:
                 if self.verbose:
@@ -461,7 +499,12 @@ class GPSimplificationStep(PipelineStep):
             if self.verbose:
                 print(f"Запуск локального поиска формулы связи для группы {group}...")
             
-            h_expr = find_best_h_for_group(gp_model, context, group) 
+            h_expr = find_best_h_for_group(
+                gp_model, context, group, 
+                optimize_constants=self.optimize_constants, 
+                allowed_constants=self.allowed_constants,
+                allowed_ops=self.allowed_ops
+            )
             
             return self._collapse_context_variables(context, h_expr, "Compositionality", gp_model)
 
@@ -552,7 +595,144 @@ class GPSimplificationStep(PipelineStep):
 
         return context_A, context_B
         
+class SymmetryPreprocessingStep(PipelineStep):
+    def __init__(self, gp_config: 'GPConfig', verbose: bool = True,
+                 optimize_constants: bool = True, allowed_constants: list = [1.0, 2.0],
+                 allowed_ops: list = ["add", "sub", "mul", "div", "sin", "cos", "exp", "log"],
+                 active_simplifiers: list = ["translational", "addition", "largescale", "multiply", "generalized"]):
+        self.gp_config = gp_config
+        self.verbose = verbose
+        self.optimize_constants = optimize_constants
+        self.allowed_constants = allowed_constants
+        self.allowed_ops = allowed_ops
+        self.active_simplifiers = active_simplifiers
 
+    def train_gp(self, dataset: pd.DataFrame, target_name: str, config: GPConfig) -> GPRegressionPipeline:
+        feature_cols = [col for col in dataset.columns if col != target_name]
+        train_x = torch.tensor(dataset[feature_cols].values, dtype=torch.float32)
+        train_y = torch.tensor(dataset[target_name].values, dtype=torch.float32)
+        pipeline = GPRegressionPipeline(config)
+        pipeline.fit(train_x, train_y)
+        return pipeline
+
+    def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
+        if self.verbose:
+            print("\n" + "="*60)
+            print("[SymmetryPreprocessingStep][ЗАПУСК] Перманентное сжатие признаков")
+            print(f"Переменные на входе: {context.get_active_features()}")
+            print("="*60)
+
+        working_context = context.copy()
+
+        simplifier_map = {
+            "translational": lambda: TranslationalSymmetrySimplifier(),
+            "addition": lambda: AdditionSymmetrySimplifier(),
+            "largescale": lambda: LargeScaleSymmetrySimplifier(),
+            "multiply": lambda: MultiplySymmetrySimplifier(),
+            "generalized": lambda: GeneralizedSymmetrySimplifier(),
+            "compositionality": lambda: CompositionalitySimplifier(
+                optimize_constants=self.optimize_constants,
+                allowed_constants=self.allowed_constants,
+                allowed_ops=self.allowed_ops
+            )
+        }
+
+        active_simplifiers = []
+        for key in self.active_simplifiers:
+            if key in simplifier_map:
+                active_simplifiers.append(simplifier_map[key]())
+            else:
+                print(f"[Warning] Unknown simplifier key for preprocessing: '{key}'")
+
+        while len(working_context.get_active_features()) > 1:
+            gp_model = self.train_gp(working_context.df, working_context.target_name, self.gp_config)
+            found_any = False
+
+            for simplifier in active_simplifiers:
+                success, result = simplifier.try_simplify(gp_model, working_context)
+                if success:
+                    if self.verbose:
+                        print(f"[Предобработка] Сжатие по симметрии: {simplifier.name} -> {result}")
+                    
+                    working_context = self._collapse_context_variables(
+                        working_context, result, simplifier.name, gp_model
+                    )
+                    found_any = True
+                    break  
+
+            if not found_any:
+                break  
+
+        if self.verbose:
+            print(f"Сжатие завершено. Переменные на выходе: {working_context.get_active_features()}")
+            print("="*60 + "\n")
+
+        return working_context
+
+    def _collapse_context_variables(self, context: 'SymbolicRegressionContext', result, 
+                                    split_type: str, gp_model) -> 'SymbolicRegressionContext':
+        new_context = context.copy()
+        df_mutated = new_context.df
+
+        if split_type in ["Translational Symmetry", "LargeScale Symmetry", "Multiply Symmetry", "Addition Symmetry"]:
+            if isinstance(result[0], list):
+                group = next(g for g in result if len(g) >= 2)
+            else:
+                group = result
+
+            x1_name, x2_name = group[0], group[1]
+            s1, s2 = sp.Symbol(x1_name), sp.Symbol(x2_name)
+
+            if split_type == "Translational Symmetry":
+                new_col_name = f"({x1_name}_minus_{x2_name})"
+                h_expr = s1 - s2
+                df_mutated[new_col_name] = df_mutated[x1_name] - df_mutated[x2_name]
+            elif split_type == "Addition Symmetry": 
+                new_col_name = f"({x1_name}_plus_{x2_name})"
+                h_expr = s1 + s2
+                df_mutated[new_col_name] = df_mutated[x1_name] + df_mutated[x2_name]
+            elif split_type == "LargeScale Symmetry":
+                new_col_name = f"({x1_name}_div_{x2_name})"
+                h_expr = s1 / s2
+                df_mutated[new_col_name] = df_mutated[x1_name] / (df_mutated[x2_name] + 1e-19)
+            elif split_type == "Multiply Symmetry":
+                new_col_name = f"({x1_name}_mul_{x2_name})"
+                h_expr = s1 * s2
+                df_mutated[new_col_name] = df_mutated[x1_name] * df_mutated[x2_name]
+
+            df_mutated.drop(columns=[x1_name, x2_name], inplace=True)
+
+            new_dim = DimensionalityEvaluator.evaluate(h_expr, context.registry)
+            new_context.register_mutation([x1_name, x2_name], new_col_name, h_expr, new_dim)
+
+        elif split_type == "Compositionality":
+            h_expr = result
+            symbols = sorted(list(h_expr.free_symbols), key=lambda s: s.name)
+            involved_vars = [sym.name for sym in symbols]
+            f_h = sp.lambdify(symbols, h_expr, 'numpy')
+            args = [df_mutated[name].values for name in involved_vars]
+            new_col_name = f"({str(h_expr)})"
+            df_mutated[new_col_name] = f_h(*args)
+            df_mutated.drop(columns=involved_vars, inplace=True)
+
+            new_dim = DimensionalityEvaluator.evaluate(h_expr, context.registry)
+            new_context.register_mutation(involved_vars, new_col_name, h_expr, new_dim)
+
+        elif split_type == "Generalized Symmetry":
+            group = result 
+            if self.verbose:
+                print(f"Запуск локального поиска формулы связи для группы {group}...")
+            
+            h_expr = find_best_h_for_group(
+                gp_model, context, group, 
+                optimize_constants=self.optimize_constants, 
+                allowed_constants=self.allowed_constants,
+                allowed_ops=self.allowed_ops
+            )
+            
+            return self._collapse_context_variables(context, h_expr, "Compositionality", gp_model)
+
+        return new_context
         
         
 

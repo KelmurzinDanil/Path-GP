@@ -39,12 +39,18 @@ class GPTrainer:
         best_loss = float('inf')
         patience_counter = 0
 
+        loss_modifier = self.config.training.loss_modifier
+
         for epoch in range(epochs):
             try:
+                if loss_modifier is not None:
+                    x_input = train_x.clone().detach().requires_grad_(True)
+                else:
+                    x_input = train_x
                 if self.config.training.optimizer == "lbfgs":
                     def closure():
                         optimizer.zero_grad()
-                        output = model(train_x)
+                        output = model(x_input)
                         loss = -loss_fn(output, train_y)
                         loss.backward()
                         return loss
@@ -57,8 +63,12 @@ class GPTrainer:
 
                 else:
                     optimizer.zero_grad()
-                    output = model(train_x)
+                    output = model(x_input)
                     loss = -loss_fn(output, train_y)
+
+                    if loss_modifier is not None:
+                        loss = loss_modifier(model, likelihood, output, x_input, train_y, loss)
+                        
                     loss.backward()
                     optimizer.step()
             except (gpytorch.utils.errors.NanError, RuntimeError) as e:

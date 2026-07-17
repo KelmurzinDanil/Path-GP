@@ -692,7 +692,10 @@ struct PyParetoRecord {
 std::vector<PyParetoRecord> run_brute_force(
     const std::vector<std::vector<double>>& X, 
     const std::vector<double>& Y, 
-    int max_length) {
+    int max_length,
+    const std::vector<double>& allowed_constants,
+    bool optimize_constants,
+    const std::vector<std::string>& allowed_ops) {
         std::vector<Token> alphabet;
 
         if(!X.empty()){
@@ -701,18 +704,37 @@ std::vector<PyParetoRecord> run_brute_force(
             }
         }
 
-        alphabet.push_back({TokenType::Constant, 1.0});
-        alphabet.push_back({TokenType::Constant, 2.0});
-        alphabet.push_back({TokenType::Placeholder, 0.0}); 
+        for (double c: allowed_constants){
+            alphabet.push_back({TokenType::Constant, c});
+        }
 
-        alphabet.push_back({TokenType::Add, 0.0});
-        alphabet.push_back({TokenType::Sub, 0.0});
-        alphabet.push_back({TokenType::Mul, 0.0});
-        alphabet.push_back({TokenType::Div, 0.0});
-        alphabet.push_back({TokenType::Sin, 0.0});
-        alphabet.push_back({TokenType::Cos, 0.0});
-        alphabet.push_back({TokenType::Exp, 0.0});
-        alphabet.push_back({TokenType::Log, 0.0});
+        if (optimize_constants) {
+            alphabet.push_back({TokenType::Placeholder, 0.0}); 
+        }
+
+        static const std::map<std::string, TokenType> op_map = {
+            {"add", TokenType::Add},
+            {"sub", TokenType::Sub},
+            {"mul", TokenType::Mul},
+            {"div", TokenType::Div},
+            {"pow", TokenType::Pow},
+            {"sin", TokenType::Sin},
+            {"cos", TokenType::Cos},
+            {"tan", TokenType::Tan},
+            {"abs", TokenType::Abs},
+            {"sqrt", TokenType::Sqrt},
+            {"log", TokenType::Log},
+            {"exp", TokenType::Exp}
+        };
+
+        for (const auto& op_name : allowed_ops) {
+            auto it = op_map.find(op_name);
+            if (it != op_map.end()) {
+                alphabet.push_back({it->second, 0.0});
+            } else {
+                std::cerr << "[Warning] Unknown operator name passed from Python: " << op_name << std::endl;
+            }
+        }
 
         ParetoFrontier frontier(max_length + 1);
         Evaluator evaluator(X, Y, frontier);
@@ -754,6 +776,9 @@ PYBIND11_MODULE(fast_symbolic, m) {
         .def_readonly("expression", &PyParetoRecord::expression_str);
 
     m.def("run_brute_force", &run_brute_force, 
-          "Run symbolic regression brute force",
-          py::arg("X"), py::arg("Y"), py::arg("max_length"));
+          "Run symbolic regression brute force with custom constants",
+          py::arg("X"), py::arg("Y"), py::arg("max_length"),
+          py::arg("allowed_constants") = std::vector<double>{1.0, 2.0},
+          py::arg("optimize_constants") = true,
+          py::arg("allowed_ops") = std::vector<std::string>{"add", "sub", "mul", "div", "sin", "cos", "exp", "log"});
 }

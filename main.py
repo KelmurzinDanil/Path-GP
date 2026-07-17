@@ -2,7 +2,7 @@ from generate.generate_dataset import *
 from GP.config import GPConfig, ModelConfig, KernelConfig, TrainingConfig
 from GP.pipeline import GPRegressionPipeline
 from symbolic.sm_context import SymbolicRegressionContext, DimensionalityEvaluator
-from symbolic.pipeline_step import DimensionalAnalysisStep, GPSimplificationStep
+from symbolic.pipeline_step import DimensionalAnalysisStep, GPSimplificationStep, SymmetryPreprocessingStep
 from get_pi_complex import PhysicalRegistry
 
 import sympy as sp
@@ -41,7 +41,7 @@ def display_pipeline_results(final_context: SymbolicRegressionContext, original_
 
 if __name__ == "__main__":
     print("Генерация физических данных...")
-    n_samples = 1000
+    n_samples = 500
     
     G_vals = np.random.uniform(0.5, 2.0, n_samples)
     m1_vals = np.random.uniform(1.0, 10.0, n_samples)
@@ -86,24 +86,40 @@ if __name__ == "__main__":
         model=ModelConfig(
             mean_type="constant",
             kernel=KernelConfig(
-                type="rq",    
+                type="rbf",    
                 scale_kernel=True,   
                 ard=True             
             )
         ),
         training=TrainingConfig(
-            lr=0.02,                 
-            epochs=5000,  
+            lr=0.05,                 
+            epochs=2000,  
             early_stopping_patience=15,          
-            optimizer="adam",
+            optimizer="lbfgs",
             loss_type="mll",
             verbose=False     
         ),
     )
 
     pipeline = [
-        # DimensionalAnalysisStep(verbose=True),
-        GPSimplificationStep(gp_config=gp_config, verbose=True)
+        SymmetryPreprocessingStep(
+            gp_config=gp_config, 
+            verbose=True,
+            optimize_constants=False,       
+            allowed_constants=[1.0, 2.0],    
+            allowed_ops=["add", "sub", "mul", "div"], 
+            active_simplifiers=["translational", "addition", "largescale", "multiply", "generalized"]
+        ),
+        
+        DimensionalAnalysisStep(verbose=True),
+        
+        GPSimplificationStep(
+            gp_config=gp_config, 
+            verbose=True,
+            optimize_constants=False,
+            allowed_constants=[1.0, 2.0],
+            allowed_ops=["add", "sub", "mul", "div", "pow"]
+        )
     ]
 
     print("\nЗапуск пайплайна обработки...")

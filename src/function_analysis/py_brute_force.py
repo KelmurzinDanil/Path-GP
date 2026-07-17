@@ -11,11 +11,16 @@ from function_analysis.snap import scipy_refit, snap_and_reoptimize, eval_sympy_
 from get_pi_complex import DimensionalError, PhysicalDimension
 
 class BruteForceRunner:
-    def __init__(self, max_length: int = 8, complexity_penalty: float = 0.05):
+    def __init__(self, max_length: int = 8, complexity_penalty: float = 0.05,
+                 optimize_constants: bool = True, allowed_constants: List[float] = [1.0, 2.0],
+                 allowed_ops: List[str] = ["add", "sub", "mul", "div", "sin", "cos", "exp", "log"]):
         self.max_length = max_length
         self.complexity_penalty = complexity_penalty
+        self.optimize_constants = optimize_constants
+        self.allowed_constants = allowed_constants
+        self.allowed_ops = allowed_ops
 
-    def run(self, context: SymbolicRegressionContext, data: Optional[Tuple[np.ndarray, np.ndarray]] = None, optimize_constants: bool = True) -> Tuple[Optional[sp.Expr], float]:
+    def run(self, context: SymbolicRegressionContext, data: Optional[Tuple[np.ndarray, np.ndarray]] = None) -> Tuple[Optional[sp.Expr], float]:
         if data is not None:
             X_np, Y_np = data
         else:
@@ -25,8 +30,16 @@ class BruteForceRunner:
 
         active_features = context.get_active_features()
         print(f"[BF] Запуск перебора C++ для {len(active_features)} переменных. Max length: {self.max_length}")
-        raw_candidates = fast_symbolic.run_brute_force(X_np.tolist(), Y_np.tolist(), self.max_length)
-        
+
+        raw_candidates = fast_symbolic.run_brute_force(
+                    X_np.tolist(), 
+                    Y_np.tolist(), 
+                    self.max_length, 
+                    self.allowed_constants, 
+                    self.optimize_constants,
+                    self.allowed_ops
+                )   
+             
         if not raw_candidates:
             print("[BF] C++ движок не вернул кандидатов.")
             return None, float('inf')
@@ -73,41 +86,8 @@ class BruteForceRunner:
         best_score = float('inf')
         best_mse = float('inf')
         
-        for record in raw_candidates:
-            expr = rpn_to_sympy(record.expression)
-            if expr is None:
-                continue
-            
-            # 1. Проверяем физическую размерность на отмаппленном выражении (Pi_i)
-            mapped_expr = self._map_symbols_to_features(expr, active_features)
-            try:
-                candidate_dim = DimensionalityEvaluator.evaluate(mapped_expr, context.registry)
-                if candidate_dim != target_dim:
-                    continue
-            except DimensionalError:
-                continue
-            except NotImplementedError:
-                print("Неподдерживаемая SymPy-нода")
-                continue
-
-            # Сюда сохраняем исходное выражение (unmapped) и отмаппленное (mapped)
-            valid_candidates.append({
-                'expr_unmapped': expr,          # Содержит x_0, x_1 (для Scipy)
-                'expr_mapped': mapped_expr,      # Содержит Pi_0, Pi_1 (для физики)
-                'raw_complexity': record.complexity,
-                'raw_mse': record.mse
-            })
-
-        print(f"[BF] Физическую валидацию прошли: {len(valid_candidates)} из {len(raw_candidates)}")
-        if not valid_candidates:
-            return None, float('inf')
-        
-        best_expr = None
-        best_score = float('inf')
-        best_mse = float('inf')
-        
         for cand in valid_candidates:
-            if optimize_constants:
+            if self.optimize_constants:
                 try:
                     opt_expr_unmapped, fit_mse = scipy_refit(cand['expr_unmapped'], X_np, Y_np, start_params=None)
                     snapped_expr_unmapped = snap_and_reoptimize(opt_expr_unmapped, X_np, Y_np)
@@ -186,7 +166,11 @@ def rpn_to_sympy(rpn_str: str) -> sp.Expr:
             elif t == 'exp': stack.append(sp.exp(arg))
         else:
             try:
-                stack.append(sp.Float(float(t)))
+                val = float(t)
+                if val.is_integer():
+                    stack.append(sp.Integer(int(val)))
+                else:
+                    stack.append(sp.Float(val))
             except ValueError:
                 return None
             

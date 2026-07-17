@@ -242,13 +242,18 @@ class MultiplicationSeparabilitySimplifier(BaseSimplifier):
         )
     
 class GeneralAdditiveSeparabilitySimplifier(BaseSimplifier):
-    def __init__(self, k_sigma=3.0, num_test_points=10, pool_size=100, num_samples=30, bf_max_length=6):
+    def __init__(self, k_sigma=3.0, num_test_points=10, pool_size=100, num_samples=30, bf_max_length=6,
+                 optimize_constants=True, allowed_constants=[1.0, 2.0],
+                 allowed_ops=["add", "sub", "mul", "div", "sin", "cos", "exp", "log"]):
         super().__init__("General Additive Separability")
         self.k_sigma = k_sigma             
         self.num_test_points = num_test_points  
         self.pool_size = pool_size  
         self.num_samples = num_samples
         self.bf_max_length = bf_max_length
+        self.optimize_constants = optimize_constants
+        self.allowed_constants = allowed_constants
+        self.allowed_ops = allowed_ops
 
     def try_simplify(self, gp_model, context: 'SymbolicRegressionContext'):
         feature_names = context.get_active_features()
@@ -332,8 +337,13 @@ class GeneralAdditiveSeparabilitySimplifier(BaseSimplifier):
             target_expr=sp.Symbol("target")
         )
 
-        runner = BruteForceRunner(max_lenght=self.bf_max_length)
-        T_expr, _ = runner.run(slice_context, optimize_constants=True)
+        runner = BruteForceRunner(
+            max_length=self.bf_max_length,
+            optimize_constants=self.optimize_constants,
+            allowed_constants=self.allowed_constants,
+            allowed_ops=self.allowed_ops
+        )
+        T_expr, _ = runner.run(slice_context)
 
         if T_expr is None:
             g_inv_expr = sp.Symbol("target")
@@ -668,12 +678,16 @@ class GeneralizedSymmetrySimplifier(BaseSimplifier):
             return False, None
 
 class CompositionalitySimplifier(BaseSimplifier):
-    def __init__(self, k_sigma=3.0, num_test_points=10, pool_size=100, bf_max_lenght=6):
+    def __init__(self, k_sigma=3.0, num_test_points=10, pool_size=100, bf_max_lenght=6, optimize_constants=True, allowed_constants=[1.0, 2.0],
+                 allowed_ops=["add", "sub", "mul", "div", "sin", "cos", "exp", "log"]):
         super().__init__("Compositionality")
         self.k_sigma = k_sigma
         self.num_test_points = num_test_points
         self.pool_size = pool_size
         self.bf_max_lenght = bf_max_lenght
+        self.optimize_constants = optimize_constants
+        self.allowed_constants = allowed_constants
+        self.allowed_ops = allowed_ops
 
     def try_simplify(self, gp_model, context: 'SymbolicRegressionContext'):
         n_features = len(context.get_active_features())
@@ -681,7 +695,7 @@ class CompositionalitySimplifier(BaseSimplifier):
             return False, None
 
         test_points, base_threshold, sigma_avg, y_avg, feature_names = self._get_best_points_and_threshold(
-            gp_model, context.df, self.num_test_points, self.pool_size, self.k_sigma
+            gp_model, context, self.num_test_points, self.pool_size, self.k_sigma
         )
         dynamic_threshold = base_threshold
 
@@ -753,8 +767,13 @@ class CompositionalitySimplifier(BaseSimplifier):
                 target_expr=sp.Symbol("target")
             )
 
-            runner = BruteForceRunner(max_length=self.bf_max_lenght)
-            h_expr, _ = runner.run(slice_context, optimize_constants=False)
+            runner = BruteForceRunner(
+                max_length=self.bf_max_lenght,
+                optimize_constants=self.optimize_constants,
+                allowed_constants=self.allowed_constants,
+                allowed_ops=self.allowed_ops
+            )
+            h_expr, _ = runner.run(slice_context)
 
             
             if h_expr is None:

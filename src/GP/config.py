@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Dict, Any, Union, Type
+from typing import Literal, Optional, Dict, Any, Union, Type, Callable
 import gpytorch
 import torch
 
@@ -75,6 +75,8 @@ class TrainingConfig:
     early_stopping_patience: Optional[int] = None
 
     verbose: bool = True
+
+    loss_modifier: Optional[Callable[[Any, Any, Any, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]] = None
 
 
 @dataclass
