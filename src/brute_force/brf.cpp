@@ -305,14 +305,14 @@ struct ParetoRecord {
 class ParetoFrontier{
     private: 
         size_t max_complexity;
-        size_t K_best = 20;
+        size_t K_best;
     
         std::unique_ptr<std::atomic<double>[]> best_mses;
         std::vector<std::vector<ParetoRecord>> frontier;
         std::vector<omp_lock_t> locks;
 
     public:
-        ParetoFrontier(size_t max_comp = 32) : max_complexity(max_comp) {
+        ParetoFrontier(size_t max_comp = 32, size_t k_best_val = 50) : max_complexity(max_comp), K_best(k_best_val)  {
             frontier.resize(max_complexity);
             locks.resize(max_complexity);
             best_mses = std::make_unique<std::atomic<double>[]>(max_complexity);
@@ -598,66 +598,91 @@ public:
         : X_data(X), Y_data(Y), frontier(front) {}
 
     void evaluate_formula(const std::vector<Token>& expression) {
-        int n_placeholders = count_placeholders(expression);
+    int n_placeholders = count_placeholders(expression);
+    int placeholder_penalty = 1; 
+    int complexity = expression.size() + (n_placeholders * placeholder_penalty);
 
-        int placeholder_penalty = 1; 
-        int complexity = expression.size() + (n_placeholders * placeholder_penalty);
-
-        size_t max_complexity = frontier.get_max_complexity(); 
-
-        if (complexity >= (int)max_complexity) {
-            return; 
-        }
-        
-        std::vector<Token> optimized_expression = expression;
-        double final_mse = std::numeric_limits<double>::max();
-        
-        if(n_placeholders > 0){
-            std::vector<std::vector<double>> start_points = {
-                std::vector<double>(n_placeholders, 1.0),   
-                std::vector<double>(n_placeholders, -1.0),  
-                std::vector<double>(n_placeholders, 0.1)   
-            };
-
-            std::vector<double> best_params;
-
-            for (const auto& start_p : start_points){
-                auto opt_p = optimizer.optimize(expression, X_data, Y_data, start_p);
-
-                auto test_expr = LMOptimizer::bind_parameters(expression, opt_p);
-                double test_error = 0.0;
-                for (size_t i = 0; i < X_data.size(); ++i) {
-                    double pred = evaluate_rpn(test_expr, X_data[i]);
-                    double diff = std::isnan(pred) || std::isinf(pred) ? 1e5 : (pred - Y_data[i]);
-                    test_error += diff * diff;
-                }
-                double test_mse = test_error / X_data.size();
-
-                if (test_mse < final_mse) {
-                    final_mse = test_mse;
-                    best_params = opt_p;
-                }
-            }
-            optimized_expression = LMOptimizer::bind_parameters(expression, best_params);
-        }
-        else{
-            double best_mse = frontier.get_best_mse(complexity);
-            double accumulated_error = 0.0;
-            size_t n_samples = X_data.size();
-
-            for (size_t i = 0; i < n_samples; ++i) {
-                double pred = evaluate_rpn(expression, X_data[i]);
-                if (std::isnan(pred) || std::isinf(pred)) return;
-
-                double diff = pred - Y_data[i];
-                accumulated_error += diff * diff;
-
-                if ((accumulated_error / n_samples) > best_mse) return;
-            }
-            final_mse = accumulated_error / n_samples;
-        }
-        frontier.update(complexity, optimized_expression, final_mse);
+    size_t max_complexity = frontier.get_max_complexity(); 
+    if (complexity >= (int)max_complexity) {
+        return; 
     }
+    
+    std::vector<Token> optimized_expression = expression;
+    double final_mse = std::numeric_limits<double>::max();
+    size_t n_samples = X_data.size();
+    
+    auto calc_ols_mse = [&](const std::vector<Token>& expr) -> double {
+        double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
+        std::vector<double> preds(n_samples);
+
+        for (size_t i = 0; i < n_samples; ++i) {
+            double pred = evaluate_rpn(expr, X_data[i]);
+            if (std::isnan(pred) || std::isinf(pred)) return std::numeric_limits<double>::max();
+            
+            preds[i] = pred;
+            sum_x += pred;
+            sum_y += Y_data[i];
+            sum_xy += pred * Y_data[i];
+            sum_x2 += pred * pred;
+        }
+
+        double mean_x = sum_x / n_samples;
+        double mean_y = sum_y / n_samples;
+        double variance_x = (sum_x2 / n_samples) - (mean_x * mean_x);
+        double cov_xy = (sum_xy / n_samples) - (mean_x * mean_y);
+
+        double a = 1.0;
+        double b = 0.0;
+
+        if (variance_x > 1e-12) {
+            a = cov_xy / variance_x;
+            b = mean_y - a * mean_x;
+        } else {
+            a = 0.0;
+            b = mean_y; 
+        }
+
+        double mse = 0.0;
+        for (size_t i = 0; i < n_samples; ++i) {
+            double diff = Y_data[i] - (a * preds[i] + b);
+            mse += diff * diff;
+        }
+        return mse / n_samples;
+    };
+
+    if (n_placeholders > 0) {
+        std::vector<std::vector<double>> start_points = {
+            std::vector<double>(n_placeholders, 1.0),   
+            std::vector<double>(n_placeholders, -1.0),  
+            std::vector<double>(n_placeholders, 0.1)   
+        };
+
+        std::vector<double> best_params;
+
+        for (const auto& start_p : start_points) {
+            auto opt_p = optimizer.optimize(expression, X_data, Y_data, start_p);
+            auto test_expr = LMOptimizer::bind_parameters(expression, opt_p);
+            
+            double test_mse = calc_ols_mse(test_expr);
+
+            if (test_mse < final_mse) {
+                final_mse = test_mse;
+                best_params = opt_p;
+            }
+        }
+        optimized_expression = LMOptimizer::bind_parameters(expression, best_params);
+    } 
+    else {
+        double test_mse = calc_ols_mse(expression);
+        
+        if (test_mse > frontier.get_best_mse(complexity)) {
+            return;
+        }
+        final_mse = test_mse;
+    }
+
+    frontier.update(complexity, optimized_expression, final_mse);
+}
 };
 
 std::string tokens_to_string(const std::vector<Token>& expr){
@@ -695,7 +720,8 @@ std::vector<PyParetoRecord> run_brute_force(
     int max_length,
     const std::vector<double>& allowed_constants,
     bool optimize_constants,
-    const std::vector<std::string>& allowed_ops) {
+    const std::vector<std::string>& allowed_ops, 
+    size_t k_best) {
         std::vector<Token> alphabet;
 
         if(!X.empty()){
@@ -736,7 +762,7 @@ std::vector<PyParetoRecord> run_brute_force(
             }
         }
 
-        ParetoFrontier frontier(max_length + 1);
+        ParetoFrontier frontier(max_length + 1, k_best);
         Evaluator evaluator(X, Y, frontier);
 
         for (int len = 1; len <= max_length; ++len) {
@@ -780,5 +806,6 @@ PYBIND11_MODULE(fast_symbolic, m) {
           py::arg("X"), py::arg("Y"), py::arg("max_length"),
           py::arg("allowed_constants") = std::vector<double>{1.0, 2.0},
           py::arg("optimize_constants") = true,
-          py::arg("allowed_ops") = std::vector<std::string>{"add", "sub", "mul", "div", "sin", "cos", "exp", "log"});
+          py::arg("allowed_ops") = std::vector<std::string>{"add", "sub", "mul", "div", "sin", "cos", "exp", "log"},
+          py::arg("k_best") = 50);
 }

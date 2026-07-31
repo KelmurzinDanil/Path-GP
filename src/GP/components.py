@@ -10,6 +10,42 @@ from typing import Optional, Any, Iterable
 from .config import ModelConfig, KernelConfig, TrainingConfig, KernelType, MeanType
 
 
+class CauchyKernel(gpytorch.kernels.Kernel):
+    is_stationary = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.register_parameter(
+            name="raw_lengthscale",
+            parameter=torch.nn.Parameter(torch.zeros(*self.batch_shape, 1, 1))
+        )
+        self.register_parameter(
+            name="raw_alpha",
+            parameter=torch.nn.Parameter(torch.zeros(*self.batch_shape, 1, 1))
+        )
+        self.register_constraint("raw_lengthscale", gpytorch.constraints.Positive())
+        self.register_constraint("raw_alpha", gpytorch.constraints.Positive())
+
+    @property
+    def lengthscale(self):
+        return self.raw_lengthscale_constraint.transform(self.raw_lengthscale)
+
+    @lengthscale.setter
+    def lengthscale(self, value):
+        self._set_value("raw_lengthscale", value)
+
+    @property
+    def alpha(self):
+        return self.raw_alpha_constraint.transform(self.raw_alpha)
+
+    @alpha.setter
+    def alpha(self, value):
+        self._set_value("raw_alpha", value)
+
+    def forward(self, x1, x2, diag=False, **params):
+        dist = self.covar_dist(x1, x2, square_dist=True, diag=diag, **params)
+        return (1.0 + dist / (self.lengthscale ** 2)).pow(-self.alpha)
+    
 def get_mean(config: ModelConfig, input_dim: Optional[int] = None) -> gpytorch.means.Mean:
     mean_type = config.mean_type
 
@@ -23,10 +59,6 @@ def get_mean(config: ModelConfig, input_dim: Optional[int] = None) -> gpytorch.m
         return gpytorch.means.ZeroMean()
     elif mean_type == "constant":
         return gpytorch.means.ConstantMean()
-    elif mean_type == "linear":
-        if input_dim is None:
-            raise ValueError("input_dim is required for LinearMean")
-        return gpytorch.means.LinearMean(input_dim=input_dim)
     else:
         raise ValueError(f"Unknown mean type: {mean_type}")
     
@@ -36,56 +68,77 @@ def get_kernel(config: KernelConfig, input_dim: Optional[int] = None) -> gpytorc
     base_kernel = None
     
     if isinstance(k_type, gpytorch.kernels.Kernel):
-        base_kernel = k_type
-    
-    if isinstance(k_type, type) and issubclass(k_type, gpytorch.kernels.Kernel):
-        if ard_dims != None:
-            base_kernel = k_type(ard_num_dims=ard_dims)
+        if getattr(k_type, "ard_num_dims", None) == ard_dims or not config.ard:
+            base_kernel = k_type
         else:
-            base_kernel = k_type()
+            kernel_cls = type(k_type)
+            base_kernel = kernel_cls(ard_num_dims=ard_dims) if config.ard else kernel_cls()
+
+    elif isinstance(k_type, type) and issubclass(k_type, gpytorch.kernels.Kernel):
+        base_kernel = k_type(ard_num_dims=ard_dims) if config.ard else k_type()
     
-    if k_type == "rbf":
+    elif k_type == "rbf":
         base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
     elif k_type == "matern_32":
         base_kernel = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=ard_dims)
     elif k_type == "matern_52":
         base_kernel = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
-    elif k_type == "linear":
-        base_kernel = gpytorch.kernels.LinearKernel(ard_num_dims=ard_dims)
     elif k_type == "rq":
         base_kernel = gpytorch.kernels.RQKernel(ard_num_dims=ard_dims)
     elif k_type == "periodic":
         base_kernel = gpytorch.kernels.PeriodicKernel(ard_num_dims=ard_dims)
     elif k_type == "cosine":
         base_kernel = gpytorch.kernels.CosineKernel(ard_num_dims=ard_dims)
-    elif k_type == "polynomial":
-        base_kernel = gpytorch.kernels.PolynomialKernel(power=2, ard_num_dims=ard_dims)
+    elif k_type == "spectral_mixture":
+        num_mixtures = config.lengthscale_kernel if config.lengthscale_kernel is not None else 4
+        num_dims_val = input_dim if input_dim is not None else 1
+        base_kernel = gpytorch.kernels.SpectralMixtureKernel(
+            num_mixtures=num_mixtures, 
+            num_dims=num_dims_val
+        )
+    elif k_type == "cauchy":
+        base_kernel = CauchyKernel(ard_num_dims=ard_dims)
     else:
         raise ValueError(f"Unknown k_type: {k_type}")
 
-    if config.scale_kernel:
+    if config.use_lengthscale_prior and base_kernel is not None and hasattr(base_kernel, "register_prior"):
+        conc, rate = config.lengthscale_prior_params
+        base_kernel.register_prior(
+            "lengthscale_prior",
+            gpytorch.priors.GammaPrior(concentration=conc, rate=rate),
+            "lengthscale"
+        )
+        
+    if config.scale_kernel and not isinstance(base_kernel, gpytorch.kernels.SpectralMixtureKernel):
         return gpytorch.kernels.ScaleKernel(base_kernel)
     return base_kernel
 
-def get_likelihood(config: ModelConfig) -> gpytorch.likelihoods.Likelihood:
+def get_likelihood(config: ModelConfig, train_y: torch.Tensor = None) -> gpytorch.likelihoods.Likelihood:
     lh_config = config.likelihood
-    lh_type = lh_config.type
     kwargs = lh_config.extra_kwargs
-
-    if isinstance(lh_type, gpytorch.likelihoods.Likelihood):
-        return lh_type
-
-    if isinstance(lh_type, type) and issubclass(lh_type, gpytorch.likelihoods.Likelihood):
-        return lh_type(**kwargs)
-
-    if lh_type == "gaussian":
-        return gpytorch.likelihoods.GaussianLikelihood(**kwargs)
-    elif lh_type == "student_t":
-        return gpytorch.likelihoods.StudentTLikelihood(**kwargs)
-    elif lh_type == "bernoulli":
-        return gpytorch.likelihoods.BernoulliLikelihood(**kwargs)
+    
+    likelihood = gpytorch.likelihoods.GaussianLikelihood(**kwargs)
+    
+    if train_y is not None:
+        y_var = float(torch.var(train_y).item())
+        if y_var < 1e-8: 
+            y_var = 1.0
+            
+        min_noise = 1e-6
+        max_noise = max(0.05 * y_var, 1e-2)
+        
+        likelihood.noise_covar.register_constraint(
+            "raw_noise", 
+            gpytorch.constraints.Interval(min_noise, max_noise)
+        )
+        likelihood.noise = torch.tensor(min(1e-3, 0.001 * y_var), dtype=train_y.dtype)
     else:
-        raise ValueError(f"Unknown likelihood type: {lh_type}")
+        likelihood.noise_covar.register_constraint(
+            "raw_noise", 
+            gpytorch.constraints.Interval(1e-6, 0.05)
+        )
+
+    return likelihood
 
 def get_loss_fn(
     model: gpytorch.models.GP, 
@@ -108,10 +161,7 @@ def get_loss_fn(
         return gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
     elif loss_type == "loo":
         return gpytorch.mlls.LeaveOneOutPseudoLikelihood(likelihood, model)
-    elif loss_type == "elbo":
-        if num_data is None:
-            raise ValueError("num_data is required for VariationalELBO loss")
-        return gpytorch.mlls.VariationalELBO(likelihood, model, num_data=num_data)
+
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
     

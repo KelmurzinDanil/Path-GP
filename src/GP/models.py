@@ -2,7 +2,6 @@ import torch
 import gpytorch
 from typing import Tuple
 
-
 from .components import get_mean, get_kernel, get_likelihood
 from .config import GPConfig
 
@@ -31,10 +30,13 @@ def build_model(
     train_x: torch.Tensor, 
     train_y: torch.Tensor
 ) -> Tuple[gpytorch.models.GP, gpytorch.likelihoods.Likelihood]:
-    
-    input_dim = train_x.size(-1) if train_x.dim() > 1 else 1
 
-    likelihood = get_likelihood(config.model)
+    if train_x.dim() == 1:
+        train_x = train_x.unsqueeze(-1)
+        
+    input_dim = train_x.size(-1)
+
+    likelihood = get_likelihood(config.model, train_y)
     mean_module = get_mean(config.model, input_dim)
     covar_module = get_kernel(config.model.kernel, input_dim)
 
@@ -44,6 +46,6 @@ def build_model(
         likelihood=likelihood,
         mean_module=mean_module,
         covar_module=covar_module
-        )
+    )
     
     return (modelGP, likelihood)

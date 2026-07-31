@@ -1,194 +1,323 @@
-from get_pi_complex import (PhysicalRegistry,)
-from itertools import combinations
-import numpy as np
 import pandas as pd
+import numpy as np
+import os
+from get_pi_complex import PhysicalRegistry
 
-def generate_center_mass_formula(n_samples: int)-> pd.DataFrame:
-    """Центр масс двух тел: R = (m1*r1 + m2*r2) / (m1 + m2)"""
+def load_4_tooth_ar_br_dr_Fr_1(filepath: str = None) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    if filepath is None:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        filepath = os.path.join(current_dir, "..", "datasets", "4_tooth_ar_br_dr_Fr_1.txt")
+    
+    # aR (мм), bR (мм), dR (мм), f1 (ГГц)
+    df = pd.read_csv(filepath, sep=r'\s+', header=None, names=["aR", "bR", "dR", "f1"])
+
+    # Скорость света c0 в мм * ГГц  (так как 1 ГГц = 10^9 Гц, 1 мм = 10^-3 м => c0 = 299.792458 мм * ГГц)
+    C0_VAL = 299.792458  
+    ER_VAL = 4.5         # Относительная диэлектрическая проницаемость подложки FR4
+    VP_VAL = C0_VAL / np.sqrt(ER_VAL)  # Фазовая скорость волны в диэлектрике (~141.323 мм * ГГц)
+
+    df["c0"] = C0_VAL
+    df["er"] = ER_VAL
+    df["vp"] = VP_VAL
+
     reg = PhysicalRegistry()
-    reg.register("R",  [0, 1, 0])  # Таргет (Длина)
-    reg.register("m1", [1, 0, 0])  # Масса 1
-    reg.register("r1", [0, 1, 0])  # Координата 1
-    reg.register("m2", [1, 0, 0])  # Масса 2
-    reg.register("r2", [0, 1, 0])  # Координата 2
+    
+    reg.register("aR", [0, 1, 0])
+    reg.register("bR", [0, 1, 0])
+    reg.register("dR", [0, 1, 0])
+    
+    reg.register("c0", [0, 1, -1])
+    reg.register("vp", [0, 1, -1])
+    
+    reg.register("er", [0, 0, 0])
 
+    
+    reg.register("f1", [0, 0, -1])
+    target_name = "f1"
+
+    print(f"Размер выборки: {len(df)} строк")
+    print(f"Колонки: {list(df.columns)}")
+    print("\nРазмерности переменных [M, L, T]:")
+    for var_name, var_obj in reg.variables.items():
+        print(f"  {var_name:8s} -> {var_obj.dimension}")
+
+    return df, reg, target_name
+
+def generate_complex_gravity_relativity_dataset(n_samples: int = 400, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    ТЕСТОВЫЙ ДАТАСЕТ 1: Гравитационно-релятивистская сила
+    
+    Формула: 
+      force = (G * m1 * m2 / ((r1 - r2)**2 + h**2)) * (1 + (v / c)**2)
+      
+    Что тестирует:
+    1. Сдвиговая симметрия (Translational): (r1 - r2)
+    2. Симметрия сложения / Пифагора (Addition): (r1 - r2)**2 + h**2
+    3. Масштабная симметрия (LargeScale): v / c
+    4. Мультипликативная разделяемость (Multiplicative Separability): 
+       F_grav(m1, m2, r1, r2, h) * F_rel(v, c)
+    5. Физические размерности: [M=1, L=1, T=-2] (Сила)
+    """
+    np.random.seed(42)
+    
     m1 = np.random.uniform(1.0, 10.0, n_samples)
     m2 = np.random.uniform(1.0, 10.0, n_samples)
-    r1 = np.random.uniform(0.5, 5.0, n_samples)
-    r2 = np.random.uniform(0.5, 5.0, n_samples)
+    r1 = np.random.uniform(10.0, 50.0, n_samples)
+    r2 = np.random.uniform(1.0, 9.0, n_samples)
+    h  = np.random.uniform(2.0, 15.0, n_samples)
+    v  = np.random.uniform(10.0, 100.0, n_samples)
+    c  = np.random.uniform(300.0, 500.0, n_samples)
+    G  = np.full(n_samples, 6.674) # Масштабированная гравитационная постоянная
 
-    R = (m1*r1 + m2*r2) / (m1 + m2)
+    # Истинная физическая формула
+    f_grav = G * m1 * m2 / ((r1 - r2)**2 + h**2)
+    f_rel  = 1.0 + (v / c)**2
+    y = f_grav * f_rel
+    
+    if noise_std > 0:
+        y += np.random.normal(0, noise_std * np.std(y), n_samples)
 
-    raw_data = {"R": R, "m1": m1, "r1": r1, "m2": m2, "r2": r2}
-    
-    c_part, nullspace = reg.find_all_basic_solutions_sympy("R")
-    reg.display_solutions("R", c_part, nullspace)
-    
-    df_raw = pd.DataFrame(reg.transform_dataset(raw_data, "R", c_part, nullspace))
-    
-    df_raw.rename(columns={"R_dimensionless": "target"}, inplace=True)
-    
-    return df_raw, reg, "R", c_part, nullspace
+    df = pd.DataFrame({
+        "m1": m1, "m2": m2, "r1": r1, "r2": r2, "h": h,
+        "v": v, "c": c, "G": G, "force": y
+    })
 
-def generate_relativistic_momentum_formula(n_samples: int) -> pd.DataFrame:
-    """Релятивистский импульс: p = m0 * v / sqrt(1 - v^2 / c^2)"""
     reg = PhysicalRegistry()
-    reg.register("p",  [1, 1, -1]) # Таргет (Импульс)
-    reg.register("m0", [1, 0, 0])  # Масса покоя
-    reg.register("v",  [0, 1, -1]) # Скорость частицы
-    reg.register("c",  [0, 1, -1]) # Скорость света
+    # Размеры: [M, L, T]
+    reg.register("m1", [1, 0, 0])
+    reg.register("m2", [1, 0, 0])
+    reg.register("r1", [0, 1, 0])
+    reg.register("r2", [0, 1, 0])
+    reg.register("h",  [0, 1, 0])
+    reg.register("v",  [0, 1, -1])
+    reg.register("c",  [0, 1, -1])
+    reg.register("G",  [-1, 3, -2])
+    reg.register("force", [1, 1, -2])
 
-    m0 = np.random.uniform(0.1, 5.0, n_samples)
-    c = np.random.uniform(3.0, 5.0, n_samples) 
-    v = np.random.uniform(0.1, 0.9, n_samples) * c 
+    target_name = "force"
+    return df, reg, target_name
+
+def generate_complex_thermo_wave_dataset(n_samples: int = 400, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    ТЕСТОВЫЙ ДАТАСЕТ 2: Термодинамическая эффективная скорость волны
     
-    p = (m0 * v) / np.sqrt(1.0 - (v**2 / c**2))
+    Формула:
+      velocity = sqrt( (kB * T / m) * log(1 + (p1 * p2) / p0**2) + v0**2 )
+      
+    Что тестирует:
+    1. Обобщенная аддитивная разделяемость (General Additive): 
+       velocity**2 = z_A(T, m, p1, p2, p0, kB) + z_B(v0)  (Преобразование квадрата y**2)
+    2. Произведение симметрия (Multiply): p1 * p2
+    3. Масштабная симметрия (LargeScale): (p1 * p2) / p0**2
+    4. Композиционность (Compositionality): log(1 + ...)
+    5. Физические размерности c 4 базисами: [M, L, T, Theta(Температура)]
+    """
+    np.random.seed(42)
 
-    raw_data = {"p": p, "m0": m0, "v": v, "c": c}
-    
-    c_part, nullspace = reg.find_all_basic_solutions_sympy("p")
-    reg.display_solutions("p", c_part, nullspace)
+    T  = np.random.uniform(100.0, 500.0, n_samples)
+    m  = np.random.uniform(1.0, 5.0, n_samples)
+    p1 = np.random.uniform(2.0, 10.0, n_samples)
+    p2 = np.random.uniform(2.0, 10.0, n_samples)
+    p0 = np.random.uniform(5.0, 20.0, n_samples)
+    v0 = np.random.uniform(10.0, 50.0, n_samples)
+    kB = np.full(n_samples, 1.38) # Постоянная Больцмана
 
-    df_raw = pd.DataFrame(reg.transform_dataset(raw_data, "p", c_part, nullspace))
-    
-    df_raw.rename(columns={"p_dimensionless": "target"}, inplace=True)
+    # Истинная физическая формула
+    term_A = (kB * T / m) * np.log(1.0 + (p1 * p2) / (p0**2))
+    term_B = v0**2
+    y = np.sqrt(term_A + term_B)
 
-    return df_raw, reg, "p", c_part, nullspace
+    if noise_std > 0:
+        y += np.random.normal(0, noise_std * np.std(y), n_samples)
 
-def generate_gravitational_attraction_in_2D_formula(n_samples: int) -> pd.DataFrame:
-    """Сила тяжести в 2D: F = G * m1 * m2 / ((x2-x1)^2 + (y2-y1)^2)"""
+    df = pd.DataFrame({
+        "T": T, "m": m, "p1": p1, "p2": p2, "p0": p0,
+        "v0": v0, "kB": kB, "velocity": y
+    })
+
     reg = PhysicalRegistry()
-    reg.register("F",  [1, 1, -2])  # Таргет (Сила)
-    reg.register("G",  [-1, 3, -2]) # Гравитационная постоянная
-    reg.register("m1", [1, 0, 0])   # Масса 1
-    reg.register("m2", [1, 0, 0])   # Масса 2
-    reg.register("x1", [0, 1, 0])   # Координаты
-    reg.register("x2", [0, 1, 0])
-    reg.register("y1", [0, 1, 0])
-    reg.register("y2", [0, 1, 0])
+    # Размеры: [M, L, T, Theta]
+    reg.register("T",  [0, 0, 0, 1])
+    reg.register("m",  [1, 0, 0, 0])
+    reg.register("p1", [1, -1, -2, 0])
+    reg.register("p2", [1, -1, -2, 0])
+    reg.register("p0", [1, -1, -2, 0])
+    reg.register("v0", [0, 1, -1, 0])
+    reg.register("kB", [1, 2, -2, -1])
+    reg.register("velocity", [0, 1, -1, 0])
 
-    G = np.random.uniform(0.5, 2.0, n_samples)
-    m1 = np.random.uniform(1.0, 10.0, n_samples)
-    m2 = np.random.uniform(1.0, 10.0, n_samples)
-    x1 = np.random.uniform(-5.0, -1.0, n_samples)
-    x2 = np.random.uniform(1.0, 6.0, n_samples)
-    y1 = np.random.uniform(-5.0, -1.0, n_samples)
-    y2 = np.random.uniform(1.0, 6.0, n_samples)
-    
-    r_squared = (x2 - x1)**2 + (y2 - y1)**2
-    F = (G * m1 * m2) / r_squared
+    target_name = "velocity"
+    return df, reg, target_name
 
-    raw_data = {"F": F, "G": G, "m1": m1, "m2": m2, "x1": x1, "x2": x2, "y1": y1, "y2": y2}
-    
-    c_part, nullspace = reg.find_all_basic_solutions_sympy("F")
-    reg.display_solutions("F", c_part, nullspace)
+def generate_test_1_trans_addsep(n_samples: int = 500, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    Тест 1: Сдвиговая симметрия + Аддитивная сепарабельность
+    Формула: y = (x1 - x2)^2 + x3 * x4
+    Ожидаемые шаги: 
+      1) TranslationalSymmetry: (x1 - x2) -> u
+      2) AdditiveSeparability: y = f1(u) + f2(x3, x4)
+      3) BRF: u^2 и x3 * x4
+    """
+    np.random.seed(42)
+    x1 = np.random.uniform(5.0, 15.0, n_samples)
+    x2 = np.random.uniform(1.0, 5.0, n_samples)
+    x3 = np.random.uniform(1.0, 10.0, n_samples)
+    x4 = np.random.uniform(1.0, 10.0, n_samples)
 
-    df_raw = pd.DataFrame(reg.transform_dataset(raw_data, "F", c_part, nullspace))
-    
-    df_raw.rename(columns={"F_dimensionless": "target"}, inplace=True)
+    y = (x1 - x2)**2 + x3 * x4
+    if noise_std > 0:
+        y += np.random.normal(0, noise_std * np.std(y), n_samples)
 
-    return df_raw, reg, "F", c_part, nullspace
-
-def generate_harmonic_oscillator_energy_formula(n_samples: int) -> pd.DataFrame:
-    """Средняя-Сложная: Энергия осциллятора: E = 0.5 * m * (w^2 + w0^2) * x^2"""
+    df = pd.DataFrame({"x1": x1, "x2": x2, "x3": x3, "x4": x4, "target": y})
     reg = PhysicalRegistry()
-    reg.register("E",      [1, 2, -2]) # Таргет (Энергия)
-    reg.register("m",      [1, 0, 0])  # Масса
-    reg.register("omega",  [0, 0, -1]) # Вынужденная частота
-    reg.register("omega0", [0, 0, -1]) # Собственная частота
-    reg.register("x",      [0, 1, 0])  # Смещение
+    for col in ["x1", "x2", "x3", "x4", "target"]:
+        reg.register(col, [0, 0, 0])
 
-    m = np.random.uniform(0.5, 5.0, n_samples)
-    omega = np.random.uniform(1.0, 10.0, n_samples)
-    omega0 = np.random.uniform(1.0, 10.0, n_samples)
-    x = np.random.uniform(0.1, 3.0, n_samples)
-    
-    E = 0.5 * m * (omega**2 + omega0**2) * (x**2)
+    return df, reg, "target"
 
-    raw_data = {"E": E, "m": m, "omega": omega, "omega0": omega0, "x": x}
-    
-    c_part, nullspace = reg.find_all_basic_solutions_sympy("E")
-    reg.display_solutions("E", c_part, nullspace)
 
-    df_raw = pd.DataFrame(reg.transform_dataset(raw_data, "E", c_part, nullspace))
-    df_raw.rename(columns={"E_dimensionless": "target"}, inplace=True)
-    return df_raw, reg, "E", c_part, nullspace
+def generate_test_2_scale_multsep(n_samples: int = 500, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    Тест 2: Масштабная симметрия (отношение) + Мультипликативная сепарабельность
+    Формула: y = (x1 / x2) * (x3 + x4)
+    Ожидаемые шаги:
+      1) LargeScaleSymmetry: (x1 / x2) -> v
+      2) MultiplicativeSeparability: y = f1(v) * f2(x3, x4)
+      3) BRF: v и (x3 + x4)
+    """
+    np.random.seed(42)
+    x1 = np.random.uniform(10.0, 50.0, n_samples)
+    x2 = np.random.uniform(2.0, 10.0, n_samples)
+    x3 = np.random.uniform(1.0, 10.0, n_samples)
+    x4 = np.random.uniform(1.0, 10.0, n_samples)
 
-def generate_boltzmann_density_formula(n_samples: int) -> pd.DataFrame:
-    """Сложная: Плотность газа Больцмана: n = n0 * exp(- m * g * x / E_th)"""
+    y = (x1 / x2) * (x3 + x4)
+    if noise_std > 0:
+        y += np.random.normal(0, noise_std * np.std(y), n_samples)
+
+    df = pd.DataFrame({"x1": x1, "x2": x2, "x3": x3, "x4": x4, "target": y})
     reg = PhysicalRegistry()
-    reg.register("n",    [0, -3, 0]) # Таргет (Концентрация)
-    reg.register("n0",   [0, -3, 0]) # Начальная концентрация
-    reg.register("m",    [1, 0, 0])  # Масса молекулы
-    reg.register("g",    [0, 1, -2]) # Ускорение силы тяжести
-    reg.register("x",    [0, 1, 0])  # Высота
-    reg.register("Eth",  [1, 2, -2]) # Тепловая энергия (kT)
+    for col in ["x1", "x2", "x3", "x4", "target"]:
+        reg.register(col, [0, 0, 0])
 
-    n0 = np.random.uniform(10.0, 100.0, n_samples)
-    
-    m = np.random.uniform(1.0, 2.0, n_samples)
-    g = np.random.uniform(9.8, 10.0, n_samples)
-    x = np.random.uniform(0.1, 2.0, n_samples)
-    Eth = np.random.uniform(10.0, 30.0, n_samples) 
-    
-    n = n0 * np.exp(- (m * g * x) / Eth)
+    return df, reg, "target"
 
-    raw_data = {"n": n, "n0": n0, "m": m, "g": g, "x": x, "Eth": Eth}
-    
-    c_part, nullspace = reg.find_all_basic_solutions_sympy("n")
-    reg.display_solutions("n", c_part, nullspace)
 
-    df_raw = pd.DataFrame(reg.transform_dataset(raw_data, "n", c_part, nullspace))
-    df_raw.rename(columns={"n_dimensionless": "target"}, inplace=True)
-    return df_raw, reg, "n", c_part, nullspace
+def generate_test_3_dim_addition(n_samples: int = 500, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    Тест 3: Физическая размерность + Симметрия сложения
+    Формула: force = (m * a) / (r1 + r2)
+    Размерности: m [M=1], a [L=1, T=-2], r1, r2 [L=1], force [M=1, L=0, T=-2]
+    Ожидаемые шаги:
+      1) DimensionalAnalysisStep: выделяет якорь (m * a / r1) и Pi_1 = r2 / r1
+      2) AdditionSymmetry: (r1 + r2)
+      3) BRF: вычисляет 1 / (1 + Pi_1)
+    """
+    np.random.seed(42)
+    m  = np.random.uniform(1.0, 10.0, n_samples)
+    a  = np.random.uniform(1.0, 5.0, n_samples)
+    r1 = np.random.uniform(2.0, 10.0, n_samples)
+    r2 = np.random.uniform(1.0, 5.0, n_samples)
 
-def generate_boltzmann_density_formula_with_noise(n_samples: int, noise_level: float = 0.02) -> pd.DataFrame:
-    """Сложная: Плотность газа Больцмана: n = n0 * exp(- m * g * x / E_th)"""
-    reg = PhysicalRegistry() 
-    reg.register("n", [0, -3, 0])     # Таргет (Концентрация)
-    reg.register("n0", [0, -3, 0])    # Начальная концентрация 
-    reg.register("m", [1, 0, 0])      # Масса молекулы 
-    reg.register("g", [0, 1, -2])     # Ускорение силы тяжести 
-    reg.register("x", [0, 1, 0])      # Высота 
-    reg.register("Eth", [1, 2, -2])   # Тепловая энергия (kT)
+    force = (m * a) / (r1 + r2)
+    if noise_std > 0:
+        force += np.random.normal(0, noise_std * np.std(force), n_samples)
 
-    n0 = np.random.uniform(10.0, 100.0, n_samples)
+    df = pd.DataFrame({"m": m, "a": a, "r1": r1, "r2": r2, "force": force})
 
-    m = np.random.uniform(1.0, 2.0, n_samples)
-    g = np.random.uniform(9.8, 10.0, n_samples)
-    x = np.random.uniform(0.1, 2.0, n_samples)
-    Eth = np.random.uniform(10.0, 30.0, n_samples) 
+    reg = PhysicalRegistry()
+    reg.register("m",  [1, 0, 0])   # Масса M
+    reg.register("a",  [0, 1, -2])  # Ускорение L/T^2
+    reg.register("r1", [0, 1, 0])   # Расстояние L
+    reg.register("r2", [0, 1, 0])   # Расстояние L
+    reg.register("force", [1, 0, -2]) # Сила на единицу длины M/T^2
 
-    n = n0 * np.exp(- (m * g * x) / Eth)
+    return df, reg, "force"
 
-    if noise_level > 0:
-        noise = np.random.normal(0, noise_level, n_samples)
-        n = n * (1 + noise)
-        n = np.clip(n, 1e-9, None)
 
-    raw_data = {"n": n, "n0": n0, "m": m, "g": g, "x": x, "Eth": Eth}
+def generate_test_4_mul_trans(n_samples: int = 500, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    Тест 4: Симметрия произведения + Сдвиг
+    Формула: y = sin(x1 * x2) + (x3 - x4)^2
+    Ожидаемые шаги:
+      1) MultiplySymmetry: (x1 * x2) -> w
+      2) TranslationalSymmetry: (x3 - x4) -> z
+      3) BRF: sin(w) + z^2
+    """
+    np.random.seed(42)
+    x1 = np.random.uniform(0.5, 3.0, n_samples)
+    x2 = np.random.uniform(0.5, 3.0, n_samples)
+    x3 = np.random.uniform(5.0, 15.0, n_samples)
+    x4 = np.random.uniform(1.0, 5.0, n_samples)
 
-    c_part, nullspace = reg.find_all_basic_solutions_sympy("n")
-    reg.display_solutions("n", c_part, nullspace)
+    y = np.sin(x1 * x2) + (x3 - x4)**2
+    if noise_std > 0:
+        y += np.random.normal(0, noise_std * np.std(y), n_samples)
 
-    df_raw = pd.DataFrame(reg.transform_dataset(raw_data, "n", c_part, nullspace))
-    df_raw.rename(columns={"n_dimensionless": "target"}, inplace=True)
-    return df_raw, reg, "n", c_part, nullspace
+    df = pd.DataFrame({"x1": x1, "x2": x2, "x3": x3, "x4": x4, "target": y})
+    reg = PhysicalRegistry()
+    for col in ["x1", "x2", "x3", "x4", "target"]:
+        reg.register(col, [0, 0, 0])
+
+    return df, reg, "target"
+
+
+def generate_test_5_genadd_scale(n_samples: int = 500, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    Тест 5: Обобщенная аддитивность (Log) + Отношение
+    Формула: y = exp((x1 - x2) + (x3 / x4))
+    Ожидаемые шаги:
+      1) GeneralAdditiveSeparability: определят g^-1(y) = ln(y)
+      2) TranslationalSymmetry / LargeScaleSymmetry: сворачивают пары (x1 - x2) и (x3 / x4)
+      3) BRF: решает комбинацию
+    """
+    np.random.seed(42)
+    x1 = np.random.uniform(2.0, 5.0, n_samples)
+    x2 = np.random.uniform(0.5, 2.0, n_samples)
+    x3 = np.random.uniform(2.0, 10.0, n_samples)
+    x4 = np.random.uniform(1.0, 4.0, n_samples)
+
+    y = np.exp((x1 - x2) + (x3 / x4))
+    if noise_std > 0:
+        y += np.random.normal(0, noise_std * np.std(y), n_samples)
+
+    df = pd.DataFrame({"x1": x1, "x2": x2, "x3": x3, "x4": x4, "target": y})
+    reg = PhysicalRegistry()
+    for col in ["x1", "x2", "x3", "x4", "target"]:
+        reg.register(col, [0, 0, 0])
+
+    return df, reg, "target"
+
+def generate_test_6_gen_comp(n_samples: int = 500, noise_std: float = 0.0) -> tuple[pd.DataFrame, PhysicalRegistry, str]:
+    """
+    Тест 6: Сложная проверка Generalized Symmetry и Compositionality
+    Формула: y = cos(x1 + x2) * (x3 - x4)^2 + exp(x1 + x2)
+    Ожидаемые шаги:
+      1) GeneralizedSymmetry / Compositionality: находят группу (x1, x2) -> h1 = x1 + x2
+      2) GeneralizedSymmetry / Compositionality: находят группу (x3, x4) -> h2 = x3 - x4
+      3) Финальный BF: сжимает cos(u) * v^2 + exp(u)
+    """
+    np.random.seed(42)
+    x1 = np.random.uniform(0.5, 2.0, n_samples)
+    x2 = np.random.uniform(0.5, 2.0, n_samples)
+    x3 = np.random.uniform(3.0, 7.0, n_samples)
+    x4 = np.random.uniform(0.5, 2.5, n_samples)
+
+    u = x1 + x2
+    v = x3 - x4
+    y = np.cos(u) * (v**2) + np.exp(u)
+
+    if noise_std > 0:
+        y += np.random.normal(0, noise_std * np.std(y), n_samples)
+
+    df = pd.DataFrame({"x1": x1, "x2": x2, "x3": x3, "x4": x4, "target": y})
+    reg = PhysicalRegistry()
+    for col in ["x1", "x2", "x3", "x4", "target"]:
+        reg.register(col, [0, 0, 0])
+
+    return df, reg, "target"
 
 if __name__ == "__main__":
-    print("\n--- ГЕНЕРАЦИЯ ДАТАСЕТОВ ДЛЯ ФИЗИЧЕСКИХ ЭКСПЕРИМЕНТОВ ---\n")
-    
-    df_1 = generate_center_mass_formula(500)
-    print(f"1. Центр масс. Колонки: {df_1.columns.tolist()}\n")
-
-    df_2 = generate_relativistic_momentum_formula(500)
-    print(f"2. Релятивистский импульс. Колонки: {df_2.columns.tolist()}\n")
-
-    df_3 = generate_harmonic_oscillator_energy_formula(500)
-    print(f"3. Энергия осциллятора. Колонки: {df_3.columns.tolist()}\n")
-
-    df_4 = generate_boltzmann_density_formula(500)
-    print(f"4. Плотность Больцмана. Колонки: {df_4.columns.tolist()}\n")
-
-    df_5 = generate_gravitational_attraction_in_2D_formula(500)
-    print(f"5. Сила тяжести 2D. Колонки: {df_5.columns.tolist()}\n")
+    df_raw, registry, target = load_4_tooth_ar_br_dr_Fr_1()
+    print("\nПервые 5 строк датасета:")
+    print(df_raw.head())

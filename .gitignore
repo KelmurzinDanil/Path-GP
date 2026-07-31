@@ -2,8 +2,10 @@
 .venv
 src/test
 **/build/
+src/datasets/
+*.txt
+gp_best_params.json
 **/pybind11/
 **/fast_symbolic/
-
 *.so
 *.pyc

@@ -2,7 +2,7 @@ import sympy as sp
 import fast_symbolic 
 import numpy as np
 import traceback
-
+from scipy.stats import linregress
 
 from typing import List, Optional, Tuple, Dict
 
@@ -13,14 +13,99 @@ from get_pi_complex import DimensionalError, PhysicalDimension
 class BruteForceRunner:
     def __init__(self, max_length: int = 8, complexity_penalty: float = 0.05,
                  optimize_constants: bool = True, allowed_constants: List[float] = [1.0, 2.0],
-                 allowed_ops: List[str] = ["add", "sub", "mul", "div", "sin", "cos", "exp", "log"]):
+                 allowed_ops: List[str] = ["add", "sub", "mul", "div", "sin", "cos", "exp", "log"],
+                 k_best: int = 50):
         self.max_length = max_length
         self.complexity_penalty = complexity_penalty
         self.optimize_constants = optimize_constants
         self.allowed_constants = allowed_constants
         self.allowed_ops = allowed_ops
+        self.k_best = k_best
 
-    def run(self, context: SymbolicRegressionContext, data: Optional[Tuple[np.ndarray, np.ndarray]] = None) -> Tuple[Optional[sp.Expr], float]:
+    def run_top_candidates(
+        self, 
+        context: SymbolicRegressionContext, 
+        top_k: int = 5, 
+        require_all_vars: bool = True,
+        target_dim_check: bool = False
+    ) -> List[sp.Expr]:
+        active_features = context.get_active_features()
+        X_np = context.df[active_features].values
+        Y_np = context.df[context.target_name].values
+
+        raw_candidates = fast_symbolic.run_brute_force(
+            X_np.tolist(), 
+            Y_np.tolist(), 
+            self.max_length, 
+            self.allowed_constants, 
+            self.optimize_constants,
+            self.allowed_ops,
+            self.k_best
+        )   
+        if not raw_candidates:
+            return []
+
+        try:
+            target_dim = context.registry.get_dim(context.target_name)
+        except KeyError:
+            sample_dim = list(context.registry.variables.values())[0].dimension
+            target_dim = PhysicalDimension.dimensionless_like(sample_dim)
+
+        valid_exprs = []
+        for record in raw_candidates:
+            expr = rpn_to_sympy(record.expression)
+            if expr is None:
+                continue
+
+            mapped_expr = self._map_symbols_to_features(expr, active_features)
+
+            f_compiled = sp.lambdify(active_features, mapped_expr, 'numpy')
+            args = [X_np[:, active_features.index(sym.name)] for sym in active_features]
+            try:
+                preds = f_compiled(*args)
+                if np.isscalar(preds):
+                    preds = np.full_like(Y_np, preds)
+                    
+                if np.std(preds) > 1e-12:
+                    slope, intercept, _, _, _ = linregress(preds, Y_np)
+                    
+                    if abs(slope - 1.0) > 1e-5 or abs(intercept) > 1e-5:
+                        slope_clean = round(slope) if abs(slope - round(slope)) < 1e-3 else slope
+                        intercept_clean = round(intercept) if abs(intercept - round(intercept)) < 1e-3 else intercept
+                        
+                        mapped_expr = slope_clean * mapped_expr + intercept_clean
+            except Exception:
+                pass
+
+            if require_all_vars:
+                found_vars = {sym.name for sym in mapped_expr.free_symbols}
+                if not all(feat in found_vars for feat in active_features):
+                    continue
+
+            try:
+                candidate_dim = DimensionalityEvaluator.evaluate(mapped_expr, context.registry)
+                if target_dim_check and candidate_dim != target_dim:
+                    continue
+            except (DimensionalError, NotImplementedError):
+                continue
+
+            if self.optimize_constants:
+                try:
+                    opt_expr_unmapped, _ = scipy_refit(expr, X_np, Y_np, start_params=None)
+                    snapped_expr_unmapped = snap_and_reoptimize(opt_expr_unmapped, X_np, Y_np)
+                    snapped_expr = self._map_symbols_to_features(snapped_expr_unmapped, active_features)
+                    valid_exprs.append(snapped_expr)
+                except Exception:
+                    valid_exprs.append(mapped_expr)
+            else:
+                valid_exprs.append(mapped_expr)
+
+            if len(valid_exprs) >= top_k:
+                break
+
+        return valid_exprs
+    
+    def run(self, context: SymbolicRegressionContext, data: Optional[Tuple[np.ndarray, np.ndarray]] = None, target_dim_check: bool = True, require_all_vars: bool = False) -> Tuple[Optional[sp.Expr], float]:
         if data is not None:
             X_np, Y_np = data
         else:
@@ -37,7 +122,8 @@ class BruteForceRunner:
                     self.max_length, 
                     self.allowed_constants, 
                     self.optimize_constants,
-                    self.allowed_ops
+                    self.allowed_ops,
+                    self.k_best
                 )   
              
         if not raw_candidates:
@@ -60,10 +146,14 @@ class BruteForceRunner:
                 continue
 
             mapped_expr = self._map_symbols_to_features(expr, active_features)
+            if require_all_vars:
+                found_vars = {sym.name for sym in mapped_expr.free_symbols}
+                if not all(feat in found_vars for feat in active_features):
+                    continue
+
             try:
                 candidate_dim = DimensionalityEvaluator.evaluate(mapped_expr, context.registry)
-
-                if candidate_dim != target_dim:
+                if target_dim_check and candidate_dim != target_dim:
                     continue
             except DimensionalError:
                 continue
