@@ -132,20 +132,26 @@ class DimensionalityEvaluator:
         
         if isinstance(expr, sp.Add):
             args = expr.args
-            dim_first = DimensionalityEvaluator.evaluate(args[0], registry)
-
-            for arg in args[1:]:
+            
+            ref_dim = None
+            for arg in args:
                 dim_next = DimensionalityEvaluator.evaluate(arg, registry)
-                try:
-                    dim_first = dim_first + dim_next
-                except DimensionalError as e:
-                    raise DimensionalError(
-                        f"Ошибка при сложении в выражении [{expr}]:\n"
-                        f"  Слагаемое '{args[0]}' имеет размерность {DimensionalityEvaluator.evaluate(args[0], registry)}\n"
-                        f"  Слагаемое '{arg}' имеет размерность {dim_next}."
-                    ) from e
-            return dim_first
-        
+                
+                if ref_dim is None:
+                    ref_dim = dim_next
+                else:
+                    try:
+                        ref_dim = ref_dim + dim_next
+                    except DimensionalError as e:
+                        raise DimensionalError(
+                            f"Ошибка при сложении в выражении [{expr}]:\n"
+                            f"  Конфликт размерностей: {ref_dim} и {dim_next}."
+                        ) from e
+                        
+            if ref_dim is None:
+                return PhysicalDimension.dimensionless_like(sample_dim)
+                
+            return ref_dim
         if isinstance(expr, sp.Mul):
             args = expr.args
             current_dim = DimensionalityEvaluator.evaluate(args[0], registry)

@@ -60,6 +60,10 @@ class GPTrainer:
                             optimizer.zero_grad()
                             output = model(x_input)
                             loss = -loss_fn(output, train_y)
+                            
+                            if loss_modifier is not None:
+                                loss = loss_modifier(model, likelihood, output, x_input, train_y, loss)
+                                
                             loss.backward()
                             return loss
                         
@@ -97,21 +101,20 @@ class GPTrainer:
                             raise optuna.TrialPruned()
                         
                 if self.config.training.verbose and (epoch % 20 == 0 or epoch == epochs - 1):
+                    noise_val = likelihood.noise.item() if hasattr(likelihood, "noise") else 0.0
                     print(
                         f"Epoch {epoch + 1:3d}/{self.config.training.epochs} | "
                         f"Loss: {loss.item():.4f} | "
-                        f"Noise: {likelihood.noise.item():.3f}"
+                        f"Noise: {noise_val:.3f}"
                     )
                     try:
-                        ls = model.covar_module.base_kernel.lengthscale.squeeze().detach().cpu().numpy()
+                        from .utils import get_quick_kernel_info
+                        k_info = get_quick_kernel_info(model.covar_module)
+                        if k_info:
+                            print(f"  Params: {k_info}")
+                    except Exception:
+                        pass
                         
-                        if ls.ndim == 0:
-                            print(f"Lengthscale: {ls.item():.3f}")
-                        else:
-                            ls_str = ", ".join([f"{x:.3f}" for x in ls])
-                            print(f"Lengthscales (ARD): [{ls_str}]")
-                    except Exception as e:
-                        print(f"Не удалось вывести lengthscale (ошибка: {e})")
                 if current_loss < best_loss - 1e-4:
                         best_loss = current_loss
                         patience_counter = 0

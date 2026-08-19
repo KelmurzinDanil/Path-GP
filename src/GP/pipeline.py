@@ -21,7 +21,9 @@ class GPRegressionPipeline:
             self.scale_y_factor = torch.tensor(1.0, dtype=train_y.dtype, device=train_y.device)
             return
 
-        self.scale_x_factor = torch.ones(train_x.size(-1), dtype=train_x.dtype, device=train_x.device)
+        sx = torch.std(train_x, dim=0)
+        sx[sx < 1e-12] = 1.0 
+        self.scale_x_factor = sx
 
         sy = torch.std(train_y)
         self.scale_y_factor = torch.tensor(1.0, dtype=train_y.dtype, device=train_y.device) if torch.abs(sy) < 1e-12 else sy
@@ -40,8 +42,12 @@ class GPRegressionPipeline:
 
         self.model, self.likelihood = build_model(self.config, scaled_train_x, scaled_train_y)
 
+        self.model = self.model.double()
+        self.likelihood = self.likelihood.double()
+
         loss_history = self.trainer.fit(self.model, self.likelihood, scaled_train_x, scaled_train_y, trial=trial)
         return loss_history
+    
     
     def predict(self, test_x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
         if self.model is None or self.likelihood is None:

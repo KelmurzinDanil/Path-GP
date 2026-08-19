@@ -1,7 +1,8 @@
 import numpy as np
 import sympy as sp
-import itertools
-
+from scipy.linalg import lstsq
+import torch
+import torch.nn as nn
 
 class DimensionalError(ValueError):
     """Исключение, выбрасываемое при нарушении законов физической размерности."""
@@ -208,3 +209,70 @@ class PhysicalRegistry():
             nullspace_vectors.append(v)
             
         return c_particular, nullspace_vectors
+
+class DimensionalProjector:
+    @classmethod
+    def resolve_multiplicative_split(
+        cls, 
+        dim_Y: np.ndarray, 
+        M_A: np.ndarray, 
+        M_B: np.ndarray, 
+        *args, **kwargs
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dim_Y = np.asarray(dim_Y, dtype=float).flatten()
+        dim_len = len(dim_Y)
+        zero_dim = np.zeros(dim_len)
+
+        if np.allclose(dim_Y, 0):
+            return zero_dim, zero_dim
+
+        def can_express_target(M: np.ndarray, target: np.ndarray) -> tuple[bool, np.ndarray]:
+            if M.size == 0:
+                return False, np.zeros(0)
+            alpha, _, _, _ = lstsq(M, target, cond=1e-5)
+            alpha_clean = np.round(alpha * 2) / 2
+            pred = M @ alpha_clean
+            return np.allclose(pred, target, atol=1e-3), alpha_clean
+
+        def can_be_dimensionless(M: np.ndarray) -> bool:
+            if M.size == 0:
+                return False
+            if any(np.allclose(M[:, i], 0) for i in range(M.shape[1])):
+                return True
+            if M.shape[1] >= 2:
+                rank = np.linalg.matrix_rank(M, tol=1e-3)
+                if rank < M.shape[1]:
+                    return True
+                for i in range(M.shape[1]):
+                    for j in range(i + 1, M.shape[1]):
+                        if np.allclose(M[:, i], M[:, j]):
+                            return True
+            return False
+
+        can_A_Y, alpha_A = can_express_target(M_A, dim_Y)
+        can_B_Y, alpha_B = can_express_target(M_B, dim_Y)
+
+        can_A_0 = can_be_dimensionless(M_A)
+        can_B_0 = can_be_dimensionless(M_B)
+
+        valid_opt_1 = can_A_Y and can_B_0
+        valid_opt_2 = can_A_0 and can_B_Y
+
+        if valid_opt_1 and not valid_opt_2:
+            return dim_Y.copy(), zero_dim
+        elif valid_opt_2 and not valid_opt_1:
+            return zero_dim, dim_Y.copy()
+        elif valid_opt_1 and valid_opt_2:
+            cost_1 = np.sum(np.abs(alpha_A)) + M_A.shape[1] * 0.1
+            cost_2 = np.sum(np.abs(alpha_B)) + M_B.shape[1] * 0.1
+            if cost_1 <= cost_2:
+                return dim_Y.copy(), zero_dim
+            else:
+                return zero_dim, dim_Y.copy()
+        else:
+            if can_A_Y:
+                return dim_Y.copy(), zero_dim
+            elif can_B_Y:
+                return zero_dim, dim_Y.copy()
+            else:
+                return dim_Y.copy(), zero_dim

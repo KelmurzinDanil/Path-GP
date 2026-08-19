@@ -1,212 +1,48 @@
+import copy
 from abc import ABC, abstractmethod
-from typing import Tuple, List, Optional, Any, Callable
-import os
-import json
-import optuna
+from typing import Tuple, List, Optional, Dict
 import torch
 import sympy as sp
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
 import gpytorch
-
+from sklearn.ensemble import HistGradientBoostingRegressor
 from scipy.stats import spearmanr
 from .sm_context import SymbolicRegressionContext, DimensionalityEvaluator
-from get_pi_complex import DimensionalError, PhysicalRegistry
-from GP.config import GPConfig, ModelConfig, KernelConfig, TrainingConfig
-from GP.pipeline import GPRegressionPipeline
-from function_analysis.simplify import *
+from get_pi_complex import DimensionalError, PhysicalRegistry, PhysicalDimension, DimensionalProjector
+from GP.utils import train_gp_on_dataframe, train_gp_model
+from function_analysis._simplify import (
+    AdditiveSeparabilitySimplifier,
+    MultiplicationSeparabilitySimplifier,
+    CompositionalitySimplifier,
+    GeneralAdditiveSeparabilitySimplifier
+)
+
 from function_analysis.py_brute_force import BruteForceRunner
+from pi_optimizer import STEAnchorOptimizer, SequentialPiOptimizer, compute_dcor
+from config import PipelineConfig
+from logger import setup_logger
 
-simplifiers = [
-    AdditiveSeparabilitySimplifier(), 
-    MultiplicationSeparabilitySimplifier(),
-    TranslationalSymmetrySimplifier(),
-    AdditionSymmetrySimplifier(),
-    LargeScaleSymmetrySimplifier(),
-    MultiplySymmetrySimplifier(),
-    CompositionalitySimplifier(),
-    GeneralizedSymmetrySimplifier(),
-    GeneralAdditiveSeparabilitySimplifier()
-]
-
-def eval_gp_r2(pipeline: GPRegressionPipeline, dataset: pd.DataFrame, target_name: str) -> float:
-    feature_cols = [col for col in dataset.columns if col != target_name]
-    x_tensor = torch.tensor(dataset[feature_cols].values, dtype=torch.float64)
-    y_true = dataset[target_name].values
-    
-    pipeline.model.eval()
-    pipeline.likelihood.eval()
-    with torch.no_grad():
-        pred_dist = pipeline.predict(x_tensor)
-        y_pred = pred_dist.mean.numpy()
-        
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    r2 = float(1.0 - (ss_res / (ss_tot + 1e-12)))
-    return max(r2, -1.0)
-
-def svd_polynomial(df_slice: pd.DataFrame, group_cols: list, registry: PhysicalRegistry) -> Optional[sp.Expr]:
-    if len(group_cols) != 2:
-        return None
-
-    u_name, v_name = group_cols[0], group_cols[1]
-    u = df_slice[u_name].values
-    v = df_slice[v_name].values
-    Y = df_slice["target"].values
-
-    s_u, s_v = sp.Symbol(u_name), sp.Symbol(v_name)
-
-    templates = [
-        (s_u - s_v, u - v),                     # Разность / Сдвиг
-        (s_u + s_v, u + v),                     # Линейное сложение
-        (s_u**2 + s_v**2, u**2 + v**2),         # Сумма квадратов
-        (s_u**2 - s_v**2, u**2 - v**2),         # Разность квадратов
-        (s_u * s_v, u * v),                     # Произведение
-        (s_u / s_v, u / (v + 1e-9)),            # Отношение
-        ((s_u - s_v)**2, (u - v)**2),           # Квадрат разности
-        ((s_u + s_v)**2, (u + v)**2)            # Квадрат суммы
-    ]
-
-    y_targets = [
-        Y,                                      # Прямой таргет
-        1.0 / (Y + 1e-9),                       # Обратный таргет
-        np.log(np.abs(Y) + 1e-9)                # Логарифмический таргет
-    ]
-
-    for expr, t_vals in templates:
-        try:
-            DimensionalityEvaluator.evaluate(expr, registry)
-        except (DimensionalError, KeyError):
-            continue
-
-        for y_t in y_targets:
-            try:
-                if np.std(t_vals) < 1e-9 or np.std(y_t) < 1e-9:
-                    continue
-
-                corr = np.corrcoef(t_vals, y_t)[0, 1]
-                r2 = float(corr) ** 2 
-
-                if not np.isnan(r2) and r2 > 0.998:
-                    print(f"-> [Tier 1 SVD Filter] Найдена точная физическая структура: {expr} (R2 = {r2:.6f})")
-                    return expr
-            except Exception:
-                continue
-
-    return None
-
-def find_best_h_for_group(gp_model, context: 'SymbolicRegressionContext', group_cols: list, num_test_points=None, local_bf_max_length=6,
-                          optimize_constants=True, allowed_constants=[1.0, 2.0],
-                          allowed_ops=["add", "sub", "mul", "div", "sin", "cos", "exp", "log"], k_best=50) -> sp.Expr:
-    all_features = context.get_active_features()
-
-    pts_all = torch.tensor(context.df[all_features].values, dtype=torch.float64)
-
-    gp_model.model.eval()
-    gp_model.likelihood.eval()
-
-    with torch.no_grad():
-        predictions = gp_model.predict(pts_all)
-        Y_slice = predictions.mean.numpy()
-
-    df_slice_data_list = {col: context.df[col].values for col in group_cols}
-    df_slice_data_list["target"] = Y_slice
-    df_slice = pd.DataFrame(df_slice_data_list)
-
-    fast_h = svd_polynomial(df_slice, group_cols, context.registry)
-    if fast_h is not None:
-        return fast_h
-    
-    registry_slice = PhysicalRegistry()
-    registry_slice.register("target", context.registry.get_dim(context.target_name).vector)    
-    
-    mapping_slice = {}
-    for col_name in group_cols:
-        registry_slice.register(col_name, context.registry.get_dim(col_name).vector)
-        mapping_slice[col_name] = sp.Symbol(col_name)
-
-    slice_context = SymbolicRegressionContext(
-        df=df_slice,
-        registry=registry_slice,
-        target_name="target",
-        symbolic_mapping=mapping_slice,
-        target_expr=sp.Symbol("target")
-    )
-
-    runner = BruteForceRunner(
-        max_length=local_bf_max_length,
-        optimize_constants=optimize_constants, 
-        allowed_constants=allowed_constants,
-        allowed_ops=allowed_ops,
-        k_best=k_best
-    )
-
-    print(f"[Generalized Symmetry] Запуск C++ brute-force для группы {group_cols} на реальных данных...")
-
-    def evaluate_expr_mse(expr: sp.Expr, df_s: pd.DataFrame) -> float:
-        try:
-            symbols = sorted(list(expr.free_symbols), key=lambda s: s.name)
-            f_compiled = sp.lambdify(symbols, expr, 'numpy')
-            args = [df_s[s.name].values for s in symbols]
-            y_pred = f_compiled(*args)
-            if np.isscalar(y_pred):
-                y_pred = np.full(len(df_s), y_pred)
-            y_true = df_s["target"].values
-            return float(np.mean((y_true - y_pred) ** 2))
-        except Exception:
-            return float('inf')
-        
-    candidates = runner.run_top_candidates(slice_context, top_k=15, require_all_vars=True)
-
-    if not candidates:
-        print("[Generalized Symmetry] Brute-force не нашел явного выражения. Отмена упрощения.")
-        return None
-
-    best_expr = None
-    best_val_mse = float('inf')
-    X_val = df_slice[group_cols].values
-    Y_val = df_slice["target"].values
-
-    for candidate in candidates:
-        val_mse = evaluate_expr_mse(candidate, df_slice)
-        if val_mse < best_val_mse:
-            best_val_mse = val_mse
-            best_expr = candidate
-
-    if best_expr is not None:
-        print(f"-> Найдена многомерная внутренняя функция связи из Топ-{len(candidates)}: {best_expr} (MSE на срезе: {best_val_mse:.6e})")
-        return best_expr
-    else:
-        print("[Generalized Symmetry] Brute-force не нашел подходящей формулы. Отмена упрощения.")
-        return None
-    
+logger = setup_logger("Pipeline")
 
 class PipelineStep(ABC):
     @abstractmethod
     def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
         pass
 
-class DimensionalAnalysisStep(PipelineStep):
-    def __init__(self, verbose: bool = True):
-        self.verbose = verbose
+class BaseDimensionalAnalysisStep(PipelineStep, ABC):
+    def __init__(self, config: PipelineConfig):
+        self.pipeline_config = config
+        self.verbose = config.verbose
 
-    def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
-        if self.verbose:
-            print("\n" + "="*60)
-            print("[ЗАПУСК] Теорема Пи Букингема")
-            print("="*60)
-
+    def _extract_dimensional_matrices(self, context: 'SymbolicRegressionContext'):
         active_features = context.get_active_features()
         target_name = context.target_name
         n_features = len(active_features)
-
-        if n_features == 0:
-            raise ValueError("Нет доступных признаков для проведения размерного анализа.")
+        if n_features == 0: raise ValueError("Нет признаков для размерного анализа.")
 
         dim_vectors = [context.registry.get_dim(name).vector for name in active_features]
         target_dim_vector = context.registry.get_dim(target_name).vector
-
         D = sp.Matrix(np.column_stack(dim_vectors))
         a_Q = sp.Matrix(target_dim_vector)
 
@@ -214,1071 +50,676 @@ class DimensionalAnalysisStep(PipelineStep):
         rref_matrix, pivots = augmented_matrix.rref()
 
         if n_features in pivots:
-            raise DimensionalError(
-                f"Размерность целевой переменной '{target_name}' "
-                f"не может быть представлена через размерности текущих признаков {active_features}."
-            )
+            raise DimensionalError(f"Размерность '{target_name}' невыразима через {active_features}.")
 
         valid_pivots = [p for p in pivots if p < n_features]
-        free_vars = [j for j in range(n_features) if j not in valid_pivots]
-
         c_particular = sp.Matrix.zeros(n_features, 1)
         for i, p_col in enumerate(valid_pivots):
             c_particular[p_col] = rref_matrix[i, n_features]
 
-        nullspace_vectors = []
-        for free_idx in free_vars:
-            v = sp.Matrix.zeros(n_features, 1)
-            v[free_idx] = 1
-            for i, p_col in enumerate(valid_pivots):
-                v[p_col] = -rref_matrix[i, free_idx]
-            nullspace_vectors.append(v)
+        nullspace_sym = D.nullspace()
+        V_canonical = np.column_stack([np.array(v, dtype=float).flatten() for v in nullspace_sym]) if nullspace_sym else np.empty((n_features, 0))
 
-        if self.verbose:
-            self._print_solutions_summary(active_features, c_particular, nullspace_vectors)
+        return active_features, target_name, D, target_dim_vector, c_particular, V_canonical
 
+    def _vector_to_sympy_expression(self, context: 'SymbolicRegressionContext', active_features: List[str], vector) -> sp.Expr:
+        expr = sp.Integer(1)
+        for idx, power in enumerate(vector):
+            if power != 0:
+                clean_power = sp.nsimplify(power)
+                expr *= context.symbolic_mapping[active_features[idx]] ** clean_power
+        return expr
+
+    def _evaluate_vector_values(self, context: 'SymbolicRegressionContext', active_features: List[str], vector) -> np.ndarray:
+        result = np.ones(len(context.df))
+        for idx, power in enumerate(vector):
+            if power != 0:
+                result *= context.df[active_features[idx]].values ** float(power)
+        return np.nan_to_num(result, nan=1.0, posinf=1e5, neginf=-1e5)
+
+    def _create_dimensionless_context(self, context: 'SymbolicRegressionContext', active_features: List[str], anchor_vector: sp.Matrix, pi_vectors: List[sp.Matrix], target_dimless_values: np.ndarray, target_dim_vector: List[float]) -> 'SymbolicRegressionContext':
         new_df_data = {}
-
-        def evaluate_vector_values(vector: sp.Matrix) -> np.ndarray:
-            result = np.ones(len(context.df))
-
-            for idx, power in enumerate(vector):
-                if power != 0:
-                    col_vals = context.df[active_features[idx]].values
-                    result *= col_vals ** float(power)
-
-            result = np.nan_to_num(result, nan=1.0, posinf=1e5, neginf=-1e5)
-            return result
-        
-        for i, vec in enumerate(nullspace_vectors, start=1):
-            new_df_data[f"Pi_{i}"] = evaluate_vector_values(vec)
-
-        anchor_values = evaluate_vector_values(c_particular)
-        target_values = context.df[target_name].values
-        new_df_data["target"] = target_values / (anchor_values + 1e-19)
-
+        for i, vec in enumerate(pi_vectors, start=1):
+            new_df_data[f"Pi_{i}"] = self._evaluate_vector_values(context, active_features, vec)
+        new_df_data["target"] = target_dimless_values
         new_df = pd.DataFrame(new_df_data)
 
         new_registry = PhysicalRegistry()
         zero_dim_vector = [0.0] * len(target_dim_vector)
-
         for col in new_df.columns:
             new_registry.register(col, zero_dim_vector)
 
-        def vector_to_sympy_expression(vector: sp.Matrix) -> sp.Expr:
-            expr = sp.Integer(1)
-            for idx, power in enumerate(vector):
-                if power != 0:
-                    clean_power = sp.nsimplify(power)
-                    current_symbol = context.symbolic_mapping[active_features[idx]]
-                    expr *= current_symbol ** clean_power
-            return expr
-        
         new_symbolic_mapping = {}
-        for i, vec in enumerate(nullspace_vectors, start=1):
-            new_symbolic_mapping[f"Pi_{i}"] = vector_to_sympy_expression(vec)
+        for i, vec in enumerate(pi_vectors, start=1):
+            new_symbolic_mapping[f"Pi_{i}"] = self._vector_to_sympy_expression(context, active_features, vec)
 
-        anchor_expr = vector_to_sympy_expression(c_particular)
+        anchor_expr = self._vector_to_sympy_expression(context, active_features, anchor_vector)
         new_target_expr = context.target_expr / anchor_expr
 
         new_context = SymbolicRegressionContext(
-            df=new_df,
-            registry=new_registry,
-            target_name="target",
-            symbolic_mapping=new_symbolic_mapping,
-            target_expr=new_target_expr
+            df=new_df, registry=new_registry, target_name="target",
+            symbolic_mapping=new_symbolic_mapping, target_expr=new_target_expr
         )
+        new_context.anchor_expr = anchor_expr  
+        return new_context
+
+
+class DimensionalAnalysisStep(BaseDimensionalAnalysisStep):
+    def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
+        active_features, target_name, D, target_dim_vector, c_particular, V_canonical = self._extract_dimensional_matrices(context)
+
+        if self.verbose: logger.info("\n=== [ЗАПУСК] Теорема Пи Букингема (Классическая) ===")
+
+        nullspace_vectors = [sp.Matrix(V_canonical[:, col]) for col in range(V_canonical.shape[1])]
+        anchor_values = self._evaluate_vector_values(context, active_features, c_particular)
+        target_dimless = context.df[target_name].values / (anchor_values + 1e-19)
 
         if self.verbose:
-            print(f"Размерный анализ завершен. Сформировано {len(nullspace_vectors)} безразмерных комплексов.")
-            print("="*60 + "\n")
+            anchor_expr = self._vector_to_sympy_expression(context, active_features, c_particular)
+            logger.info(f"Размерный якорь: {context.registry.format_expr_inline(anchor_expr)}")
+            logger.info(f"Сформировано {len(nullspace_vectors)} безразмерных комплексов.\n")
 
-        return new_context
-    
-    
-    def _print_solutions_summary(
-        self, 
-        features: list, 
-        c_particular: sp.Matrix, 
-        nullspace_vectors: list
-    ):
-        def format_vector(vector):
-            parts = []
-            for name, power in zip(features, vector):
-                if power != 0:
-                    clean_power = sp.nsimplify(power)
-                    parts.append(f"{name}^{clean_power}" if clean_power != 1 else name)
-            return " · ".join(parts) if parts else "1"
+        return self._create_dimensionless_context(context, active_features, c_particular, nullspace_vectors, target_dimless, target_dim_vector)
 
-        print(f"Размерный якорь: {format_vector(c_particular)}")
-        if nullspace_vectors:
-            print("Полученные безразмерные Пи-группы:")
-            for i, vec in enumerate(nullspace_vectors, start=1):
-                print(f"  Pi_{i} = {format_vector(vec)}")
+
+class OptDimensionalAnalysisStep(BaseDimensionalAnalysisStep):
+    def __init__(self, config: PipelineConfig):
+        super().__init__(config)
+        self.config = config.dim_analysis
+
+    def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
+        active_features, target_name, D, target_dim_vector, c_particular, V_canonical = self._extract_dimensional_matrices(context)
+
+        if self.verbose: logger.info("\n=== [ЗАПУСК] Data-Driven Теорема Пи (STE Якорь) ===")
+
+        X_data = context.df[active_features].values
+        Y_data = context.df[target_name].values
+        log_X = np.log(np.where(X_data <= 0, 1e-9, X_data))
+        log_Y = np.log(np.where(Y_data <= 0, 1e-9, Y_data))
+
+        c_rref_powers = np.array(c_particular, dtype=float).flatten()
+        ste_opt = STEAnchorOptimizer(c_particular=c_rref_powers, V=V_canonical, l1_lambda=self.config.ste_l1_lambda)
+        c_ste_matrix = ste_opt.fit(log_X, log_Y, epochs=self.config.ste_epochs, lr=self.config.ste_lr)
+
+        anchor_values = self._evaluate_vector_values(context, active_features, c_ste_matrix)
+        target_dimless = Y_data / (anchor_values + 1e-19)
+
+        pi_opt = SequentialPiOptimizer(max_integer_search=self.config.max_integer_search, max_redundancy_dcor=self.config.max_redundancy_dcor)
+        opt_sympy_vectors = pi_opt.optimize(log_X, target_dimless, V_canonical, c_anchor_vector=c_ste_matrix)
+
+        if self.verbose:
+            self._print_optimization_summary(context, active_features, c_particular, c_ste_matrix, opt_sympy_vectors, V_canonical.shape[1], log_Y, target_dimless)
+
+        return self._create_dimensionless_context(context, active_features, c_ste_matrix, opt_sympy_vectors, target_dimless, target_dim_vector)
+
+    def _print_optimization_summary(self, context, active_features, c_rref, c_ste, opt_vectors, k_total, log_Y, target_dimless):
+        rref_str = context.registry.format_expr_inline(self._vector_to_sympy_expression(context, active_features, c_rref))
+        ste_str = context.registry.format_expr_inline(self._vector_to_sympy_expression(context, active_features, c_ste))
+
+        msg = f"\nРазмерный Якорь (RREF): Anchor_RREF = {rref_str}\n"
+        msg += f"Размерный Якорь (STE): Anchor_STE  = {ste_str}\n"
+        msg += f"Сжатие Y (std): {np.std(log_Y):.4f} ---> {np.std(np.log(np.where(target_dimless<=0, 1e-9, target_dimless))):.4f}\n"
+        msg += f"Полученные Пи-группы (Теоретическое ядро k={k_total} | Отобрано: {len(opt_vectors)}):\n"
+        
+        if opt_vectors:
+            for i, vec in enumerate(opt_vectors, start=1):
+                pi_str = context.registry.format_expr_inline(self._vector_to_sympy_expression(context, active_features, vec))
+                score = compute_dcor(self._evaluate_vector_values(context, active_features, vec), target_dimless)
+                msg += f"  Pi_{i} = {pi_str:<30} | dcor = {score:.4f}\n"
         else:
-            print("Безразмерные Пи-группы не обнаружены (система жестко определена).")
+            msg += "  [ПРЕДУПРЕЖДЕНИЕ] Ни один Пи-комплекс не прошел порог качества.\n"
+        
+        logger.info(msg)
 
 
 class GPSimplificationStep(PipelineStep):
-    def __init__(self, 
-                gp_config: 'GPConfig',
-                max_depth: int = None, 
-                local_bf_max_length: int = 6, 
-                final_bf_max_length: int = 8, 
-                k_sigma_multipliers: list = [1.0, 1.5, 2.0],
-                base_k_sigma: float = 3.0,
-                loss_degradation_tolerance: float = 0.35,
-                verbose: bool = True,
-                optimize_constants: bool = True, 
-                allowed_constants: list = [1.0, 2.0],            
-                allowed_ops: list = ["add", "sub", "mul", "div", "sin", "cos", "exp", "log"],
-                k_best: int = 50):
-        self.gp_config = gp_config
-        self.max_depth = max_depth
-        self.local_bf_max_length = local_bf_max_length
-        self.final_bf_max_length = final_bf_max_length 
-        self.loss_degradation_tolerance = loss_degradation_tolerance
-        self.verbose = verbose
-        self.optimize_constants = optimize_constants
-        self.allowed_constants = allowed_constants
-        self.allowed_ops = allowed_ops
-        self.base_k_sigma = base_k_sigma
-        self.k_sigma_multipliers = k_sigma_multipliers
-        self.k_best = k_best
+    def __init__(self, config: PipelineConfig):
+        self.pipeline_config = config
+        self.config = config.simplification
+        self.bf_config = config.brute_force
+        self.verbose = config.verbose
 
-    def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
+    def transform(self, context):
         if self.verbose:
-            print("\n" + "="*60)
-            print("[GPSimplificationStep][ЗАПУСК] Шаг GP декомпозиции")
-            print(f"Активные переменные на входе: {context.get_active_features()}")
-            print("="*60)
-        
+            logger.info(
+                f"\n=== [ЗАПУСК] Шаг GP декомпозиции ===\n"
+                f"Активные переменные: {context.get_active_features()}"
+            )
+
         working_context = context.copy()
 
-        import gpytorch
-        with gpytorch.settings.fast_computations(solves=False, log_prob=False), gpytorch.settings.cholesky_jitter(1e-3):
-            final_formula = self._recursive_solve(working_context, current_depth=0)
-        
+        with gpytorch.settings.fast_computations(
+            solves=False,
+            log_prob=False
+        ), gpytorch.settings.cholesky_jitter(1e-3):
+
+            final_formula = self._recursive_solve(
+                working_context,
+                current_depth=0
+            )
+
         working_context.target_expr = final_formula
 
         if self.verbose:
-            print("\n" + "="*60)
-            print("GP декомпозиция завершена.")
-            print(f"Полученная структура: {final_formula}")
-            print("="*60 + "\n")
+            logger.info(
+                f"GP декомпозиция завершена.\n"
+                f"Полученная структура: {final_formula}\n"
+                f"====================="
+            )
 
         return working_context
 
-
-    def combine_formulas(self, formula_A, formula_B, split_type: str) -> sp.Expr:
-        expr_A = sp.sympify(formula_A)
-        expr_B = sp.sympify(formula_B)
-        
-        sum_expr = expr_A + expr_B
-        
-        if split_type == "Additive Separability":
-            return sum_expr
-        elif split_type == "Multiplicative Separability":
-            return expr_A * expr_B
-        elif split_type == "General Additive (Linear)":
-            return sum_expr
-        elif split_type == "General Additive (Log)":
-            return sp.exp(sum_expr)
-        elif split_type == "General Additive (Sqrt)":
-            return sum_expr**2
-        elif split_type == "General Additive (Square)":
-            return sp.sqrt(sum_expr)
-        elif split_type == "General Additive (Sin)":
-            return sp.sin(sum_expr)
-        elif split_type == "General Additive (Tan)":
-            return sp.tan(sum_expr)
-        else:
-            raise ValueError(f"Неизвестный тип склейки: {split_type}")
-    
-    def train_gp(self, dataset: pd.DataFrame, target_name: str, config: GPConfig) -> GPRegressionPipeline:
-        feature_cols = [col for col in dataset.columns if col != target_name]
-        train_x = torch.tensor(dataset[feature_cols].values, dtype=torch.float64)
-        train_y = torch.tensor(dataset[target_name].values, dtype=torch.float64)
-        pipeline = GPRegressionPipeline(config)
-        loss_history = pipeline.fit(train_x, train_y)
-        return pipeline, loss_history
-
-    def _brute_force_symbolic_search(self, context: 'SymbolicRegressionContext') -> sp.Expr:
+    def _brute_force_symbolic_search(self, context: 'SymbolicRegressionContext', override_length: int) -> sp.Expr:
         feature_names = context.get_active_features()
-        run_length = self.local_bf_max_length
+        local_bf_config = copy.copy(self.bf_config)
+        local_bf_config.max_length = override_length
+        runner = BruteForceRunner(local_bf_config)
 
-        runner = BruteForceRunner(
-            max_length=run_length,
-            optimize_constants=self.optimize_constants,
-            allowed_constants=self.allowed_constants,
-            allowed_ops=self.allowed_ops,
-            k_best=self.k_best
-        )
-
-        if self.verbose:
-            print(f"[GPSimplificationStep][BF Search] Запуск brute-force для {feature_names} (Адаптивная длина: {run_length})...")
-
+        if self.verbose: logger.info(f"[BF Search] Запуск для {feature_names} (Длина: {override_length})...")
         best_expr, best_mse = runner.run(context)
+        
         if best_expr is not None:
-            if self.verbose:
-                print(f"[BF Search] Найдено явное выражение: {best_expr} (MSE: {best_mse:.6e})")
+            if self.verbose: logger.info(f"[BF Search] Найдено выражение: {best_expr} (MSE: {best_mse:.6e})")
             return best_expr
         
-        if self.verbose:
-            print("[BF Search] Корректных формул не найдено. Возврат символьной заглушки.")
-        
-        if len(feature_names) == 1:
-            x_name = feature_names[0]
-            phi = sp.Function(f"Phi_{x_name}")
-            return phi(sp.Symbol(x_name))
-        else:
-            phi = sp.Function("Phi_remaining")
-            return phi(*[sp.Symbol(name) for name in feature_names])
-        
-    def _final_brute_force_search(self, context: 'SymbolicRegressionContext') -> sp.Expr:
+        if self.verbose: logger.info("[BF Search] Формул не найдено. Возврат символьной заглушки.")
+        if len(feature_names) == 1: return sp.Function(f"Phi_{feature_names[0]}")(sp.Symbol(feature_names[0]))
+        else: return sp.Function("Phi_remaining")(*[sp.Symbol(name) for name in feature_names])
+
+
+    def _predict_values(self, model, X_eval: np.ndarray) -> np.ndarray:
+        model.model.eval()
+        model.likelihood.eval()
+        with torch.no_grad():
+            pred = model.predict(torch.tensor(X_eval, dtype=torch.float64)).mean
+        return pred.detach().cpu().numpy()
+
+    def _compute_split_numerical(
+        self,
+        context: 'SymbolicRegressionContext',
+        groups: List[List[str]],
+        gp_model,
+        split_type: str,
+        g_inv_expr: sp.Expr = None,
+    ):
         feature_names = context.get_active_features()
-        run_length = self.final_bf_max_length
-        
-        runner = BruteForceRunner(
-            max_length=run_length,
-            optimize_constants=self.optimize_constants,
-            allowed_constants=self.allowed_constants,
-            allowed_ops=self.allowed_ops
-        )
-
-        if self.verbose:
-            print(f"[GPSimplificationStep][Финальный BF] Запуск для {feature_names} (Макс. длина: {self.final_bf_max_length})...")
-
-        best_expr, best_mse = runner.run(context)
-        if best_expr is not None:
-            if self.verbose:
-                print(f"[Финальный BF] Найдено итоговое выражение: {best_expr} (MSE: {best_mse:.6e})")
-            return best_expr
-        
-        if self.verbose:
-            print("[Финальный BF] Формул не найдено. Возврат символьной заглушки.")
-        
-        if len(feature_names) == 1:
-            x_name = feature_names[0]
-            phi = sp.Function(f"Phi_{x_name}")
-            return phi(sp.Symbol(x_name))
-        else:
-            phi = sp.Function("Phi_remaining")
-            return phi(*[sp.Symbol(name) for name in feature_names])
-        
-    def _recursive_solve(self, context: 'SymbolicRegressionContext', current_depth: int) -> sp.Expr:
-        feature_names = context.get_active_features()
-
-        if len(feature_names) == 1:
-            return self._final_brute_force_search(context)
-
-        if self.max_depth is not None and current_depth >= self.max_depth:
-            return self._final_brute_force_search(context)
-        
-        if self.verbose:
-            print(f"\n--- [Глубина {current_depth}] Обучение GP для переменных: {feature_names} ---")
-
-        active_simplifiers = [
-            GeneralAdditiveSeparabilitySimplifier(
-                            num_test_points=None,
-                            bf_max_length=self.local_bf_max_length,
-                            optimize_constants=self.optimize_constants, 
-                            allowed_constants=self.allowed_constants,
-                            allowed_ops=self.allowed_ops
-            ),
-            AdditiveSeparabilitySimplifier(num_test_points=None), 
-            MultiplicationSeparabilitySimplifier(num_test_points=None),
-            TranslationalSymmetrySimplifier(num_test_points=None),
-            AdditionSymmetrySimplifier(num_test_points=None),
-            LargeScaleSymmetrySimplifier(num_test_points=None),
-            MultiplySymmetrySimplifier(num_test_points=None),
-            CompositionalitySimplifier(
-                num_test_points=None,
-                bf_max_length=self.local_bf_max_length,
-                optimize_constants=self.optimize_constants, 
-                allowed_constants=self.allowed_constants,
-                allowed_ops=self.allowed_ops,
-                k_best=self.k_best
-            ),
-            # GeneralizedSymmetrySimplifier(num_test_points=None)
-        ]
-        gp_model, loss_history = self.train_gp(context.df, context.target_name, self.gp_config)
-        current_loss = loss_history[-1] if loss_history else 1e5
-
-        active_multipliers = [1.0] if len(feature_names) <= 2 else self.k_sigma_multipliers
-
-        for mult in active_multipliers:
-            current_k_sigma = self.base_k_sigma * mult
-            rejected_candidates = []
-
-            for simplifier in active_simplifiers:
-                success, result = simplifier.try_simplify(gp_model, context, k_sigma=current_k_sigma)
-                if not success:
-                    continue
-
-                if self.verbose:
-                    print(f"[Найдена гипотеза]: {simplifier.name} -> {result}")
-
-                if simplifier.name in ["Additive Separability", "Multiplicative Separability", "General Additive Separability"]:
-                    if simplifier.name == "General Additive Separability":
-                        groups, g_inv, trans_type = result
-                        mapping = {
-                            "linear": "General Additive (Linear)", "log": "General Additive (Log)",
-                            "pow_2": "General Additive (Sqrt)", "pow_half": "General Additive (Square)",
-                            "sin": "General Additive (Sin)", "tan": "General Additive (Tan)"
-                        }
-                        split_name = mapping.get(trans_type, "General Additive (Linear)")
-                        split_res = (groups, g_inv)
-                    else:
-                        split_name = simplifier.name
-                        split_res = result
-
-                    context_A, context_B = self._split_context(context, split_res, gp_model, split_name)
-                    
-                    _, loss_h_A = self.train_gp(context_A.df, context_A.target_name, self.gp_config)
-                    _, loss_h_B = self.train_gp(context_B.df, context_B.target_name, self.gp_config)
-                    
-                    loss_A = loss_h_A[-1] if loss_h_A else 1e5
-                    loss_B = loss_h_B[-1] if loss_h_B else 1e5
-                    max_child_loss = max(loss_A, loss_B)
-                    delta_loss = max_child_loss - current_loss
-
-                    if delta_loss <= self.loss_degradation_tolerance:
-                        if self.verbose:
-                            print(f"[Принято {split_name}]: Delta Loss={delta_loss:.4f} <= {self.loss_degradation_tolerance}")
-                        formula_A = self._recursive_solve(context_A, current_depth + 1)
-                        formula_B = self._recursive_solve(context_B, current_depth + 1)
-                        return self.combine_formulas(formula_A, formula_B, split_type=split_name)
-                    else:
-                        if self.verbose:
-                            print(f"[Откат {split_name}]: Деградация лосса +{delta_loss:.4f} > {self.loss_degradation_tolerance}")
-                        rejected_candidates.append({
-                            'delta_loss': delta_loss,
-                            'type': 'split',
-                            'split_name': split_name,
-                            'context_A': context_A,
-                            'context_B': context_B
-                        })
-
-                else:
-                    mutated_context = self._collapse_context_variables(context, result, simplifier.name, gp_model)
-                    if mutated_context is None:
-                        continue
-
-                    _, test_loss_h = self.train_gp(mutated_context.df, mutated_context.target_name, self.gp_config)
-                    test_loss = test_loss_h[-1] if test_loss_h else 1e5
-                    delta_loss = test_loss - current_loss
-
-                    if delta_loss <= self.loss_degradation_tolerance:
-                        if self.verbose:
-                            print(f"[Принято {simplifier.name}]: Delta Loss={delta_loss:.4f} <= {self.loss_degradation_tolerance}")
-                        return self._recursive_solve(mutated_context, current_depth + 1)
-                    else:
-                        if self.verbose:
-                            print(f"[Откат {simplifier.name}]: Деградация лосса +{delta_loss:.4f} > {self.loss_degradation_tolerance}")
-                        rejected_candidates.append({
-                            'delta_loss': delta_loss,
-                            'type': 'collapse',
-                            'mutated_context': mutated_context
-                        })
-
-            if rejected_candidates:
-                best_cand = min(rejected_candidates, key=lambda x: x['delta_loss'])
-                if best_cand['delta_loss'] <= 0.8:
-                    if self.verbose:
-                        print(f"\nПрименяем лучшую из отвергнутых гипотез с минимальной деградацией (Delta Loss: +{best_cand['delta_loss']:.4f})")
-
-                    if best_cand['type'] == 'split':
-                        formula_A = self._recursive_solve(best_cand['context_A'], current_depth + 1)
-                        formula_B = self._recursive_solve(best_cand['context_B'], current_depth + 1)
-                        return self.combine_formulas(formula_A, formula_B, split_type=best_cand['split_name'])
-                    else:
-                        return self._recursive_solve(best_cand['mutated_context'], current_depth + 1)
-
-        if self.verbose:
-            print(f"[Рекурсия] Переход к финальному BF.")
-        return self._final_brute_force_search(context)
-
-    def _collapse_context_variables(
-        self, 
-        context: 'SymbolicRegressionContext', 
-        result, 
-        split_type: str, 
-        gp_model
-    ) -> 'SymbolicRegressionContext':
-        new_context = context.copy()
-        df_mutated = new_context.df
-
-        if split_type in ["Translational Symmetry", "LargeScale Symmetry", "Multiply Symmetry", "Addition Symmetry"]:
-            if isinstance(result[0], list):
-                group = next(g for g in result if len(g) >= 2)
-            else:
-                group = result
-
-            x1_name, x2_name = group[0], group[1]
-            s1, s2 = sp.Symbol(x1_name), sp.Symbol(x2_name)
-
-            if split_type == "Translational Symmetry":
-                new_col_name = f"({x1_name}_minus_{x2_name})"
-                h_expr = s1 - s2
-                df_mutated[new_col_name] = df_mutated[x1_name] - df_mutated[x2_name]
-            
-            elif split_type == "Addition Symmetry": 
-                new_col_name = f"({x1_name}_plus_{x2_name})"
-                h_expr = s1 + s2
-                df_mutated[new_col_name] = df_mutated[x1_name] + df_mutated[x2_name]
-
-            elif split_type == "LargeScale Symmetry":
-                new_col_name = f"({x1_name}_div_{x2_name})"
-                h_expr = s1 / s2
-                df_mutated[new_col_name] = df_mutated[x1_name] / (df_mutated[x2_name] + 1e-19)
-                
-            elif split_type == "Multiply Symmetry":
-                new_col_name = f"({x1_name}_mul_{x2_name})"
-                h_expr = s1 * s2
-                df_mutated[new_col_name] = df_mutated[x1_name] * df_mutated[x2_name]
-
-            df_mutated.drop(columns=[x1_name, x2_name], inplace=True)
-
-            new_dim = DimensionalityEvaluator.evaluate(h_expr, context.registry)
-            new_context.register_mutation([x1_name, x2_name], new_col_name, h_expr, new_dim)
-
-        elif split_type == "Compositionality":
-            if isinstance(result, tuple):
-                h_expr = result[0]
-            else:
-                h_expr = result
-
-            symbols = sorted(list(h_expr.free_symbols), key=lambda s: s.name)
-            involved_vars = [sym.name for sym in symbols]
-            f_h = sp.lambdify(symbols, h_expr, 'numpy')
-            args = [df_mutated[name].values for name in involved_vars]
-            new_col_name = f"({str(h_expr)})"
-            df_mutated[new_col_name] = f_h(*args)
-            df_mutated.drop(columns=involved_vars, inplace=True)
-
-            new_dim = DimensionalityEvaluator.evaluate(h_expr, context.registry)
-            new_context.register_mutation(involved_vars, new_col_name, h_expr, new_dim)
-
-        elif split_type == "Generalized Symmetry":
-            group = result 
-            if self.verbose:
-                print(f"Запуск локального поиска формулы связи для группы {group}...")
-            
-            h_expr = find_best_h_for_group(
-                gp_model, context, group, 
-                local_bf_max_length=self.local_bf_max_length, 
-                optimize_constants=self.optimize_constants, 
-                allowed_constants=self.allowed_constants,
-                allowed_ops=self.allowed_ops,
-                k_best=self.k_best 
-            )
-            if h_expr is None:
-                return None
-            
-            return self._collapse_context_variables(context, h_expr, "Compositionality", gp_model)
-
-        return new_context
-
-
-    def _split_context(
-        self, 
-        context: 'SymbolicRegressionContext', 
-        groups, 
-        gp_model, 
-        split_type: str
-    ) -> Tuple['SymbolicRegressionContext', 'SymbolicRegressionContext']:
-        feature_cols = context.get_active_features()
-
-        is_gas = split_type.startswith("General Additive")
-        if is_gas:
-            groups, g_inv_expr = groups
+        target_name = context.target_name
+        X_mat = context.df[feature_names].values
+        Y_val = context.df[target_name].values
 
         group_A = groups[0]
-        group_B = []
-        for g in groups[1:]:
-            group_B.extend(g)
+        group_B = [col for g in groups[1:] for col in g]        
+
+        idx_A = [feature_names.index(col) for col in group_A]
+        idx_B = [feature_names.index(col) for col in group_B] if group_B else []
+
+        N = len(X_mat)
+
+
+        if split_type == "General Additive Separability":
+            if g_inv_expr is None:
+                raise ValueError("Для General Additive Separability необходимо передать g_inv_expr.")
+
+            t_sym = sp.Symbol(target_name, real=True)
+            f_ginv = sp.lambdify(t_sym, g_inv_expr, 'numpy')
+            
+            try:
+                Z_val = f_ginv(Y_val)
+                if np.isscalar(Z_val):
+                    Z_val = np.full(N, float(Z_val))
+                Z_val = np.asarray(Z_val, dtype=float)
+            except Exception as e:
+                raise RuntimeError(f"Ошибка вычисления g^-1(Y) для выражения {g_inv_expr}: {e}")
+
+            if not np.all(np.isfinite(Z_val)) or np.std(Z_val) < 1e-9:
+                raise ValueError("Трансформация g^-1(Y) вернула невалидный сигнал (NaN, Inf или константу).")
+
+            cfg = self.pipeline_config.gp_config
+            eval_model, _ = train_gp_model(
+                torch.tensor(X_mat, dtype=torch.float64),
+                torch.tensor(Z_val, dtype=torch.float64),
+                cfg
+            )
+            working_target = Z_val
+        else:
+            eval_model = gp_model
+            working_target = Y_val
+
+        X_center = np.median(X_mat, axis=0, keepdims=True)
+        S_0 = float(self._predict_values(eval_model, X_center)[0])
+        if abs(S_0) < 1e-7:
+            S_0 = 1e-7 * np.sign(S_0 + 1e-12)
+
+        X_eval_A = X_mat.copy()
+        if idx_B:
+            for j in idx_B:
+                X_eval_A[:, j] = X_center[0, j]
+        S_A = self._predict_values(eval_model, X_eval_A)
+
+        if group_B:
+            X_eval_B = X_mat.copy()
+            for j in idx_A:
+                X_eval_B[:, j] = X_center[0, j]
+            S_B = self._predict_values(eval_model, X_eval_B)
+        else:
+            S_B = None
+
+        if split_type == "Multiplicative Separability":
+            y_A = S_A
+            y_B = (S_B / S_0) if group_B else np.ones(N)
+
+        else:
+            if group_B:
+                min_S_B = float(np.min(S_B))
+                c_B = S_0 - min_S_B
+                y_A = S_A - c_B
+                y_B = working_target - y_A
+            else:
+                y_A = S_A
+                y_B = np.zeros(N)
+
+        df_A = pd.DataFrame(X_mat[:, idx_A], columns=group_A)
+        df_A[target_name] = y_A
+
+        if group_B:
+            df_B = pd.DataFrame(X_mat[:, idx_B], columns=group_B)
+            df_B[target_name] = y_B
+        else:
+            df_B = pd.DataFrame(columns=group_B)
+            df_B[target_name] = y_B
+
+        return df_A, df_B, group_A, group_B
+
+    def combine_formulas(
+        self,
+        context: 'SymbolicRegressionContext',
+        f_A,
+        f_B,
+        split_type: str,
+        g_forward=None,
+        g_inv_expr=None,
+        c_shift: float = 0.0,
+    ) -> sp.Expr:
+        from function_analysis.snap import snap_number
+
+        e_A = sp.sympify(f_A)
+        e_B = sp.sympify(f_B)
         
+        Y_val = context.df[context.target_name].values
+        N = len(Y_val)
+
+        def eval_sym(expr: sp.Expr) -> np.ndarray:
+            syms = sorted(list(expr.free_symbols), key=lambda s: s.name)
+            if not syms:
+                return np.full(N, float(expr))
+            fn = sp.lambdify(syms, expr, 'numpy')
+            args = [context.df[s.name].values for s in syms]
+            res = fn(*args)
+            if np.isscalar(res):
+                res = np.full(N, float(res))
+            return np.asarray(res, dtype=float)
+
+        val_A = eval_sym(e_A)
+        val_B = eval_sym(e_B)
+
+        if split_type == "Additive Separability":
+            A_mat = np.vstack([val_A, val_B, np.ones(N)]).T
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(A_mat, Y_val, rcond=None)
+                alpha_A, alpha_B, beta = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+            except Exception:
+                alpha_A, alpha_B, beta = 1.0, 1.0, 0.0
+
+            if abs(beta) / (np.ptp(Y_val) + 1e-9) < 1e-3:
+                beta = 0.0
+
+            snap_A = snap_number(alpha_A)
+            snap_B = snap_number(alpha_B)
+            snap_b = snap_number(beta)
+
+            combined = snap_A * e_A + snap_B * e_B + snap_b
+            return sp.simplify(combined)
+
+        if split_type == "Multiplicative Separability":
+            prod_val = val_A * val_B
+            A_mat = np.vstack([prod_val, np.ones(N)]).T
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(A_mat, Y_val, rcond=None)
+                alpha, beta = float(coeffs[0]), float(coeffs[1])
+            except Exception:
+                alpha, beta = 1.0, 0.0
+
+            if abs(beta) / (np.ptp(Y_val) + 1e-9) < 1e-3:
+                beta = 0.0
+
+            snap_alpha = snap_number(alpha)
+            snap_beta = snap_number(beta)
+
+            combined = snap_alpha * (e_A * e_B) + snap_beta
+            return sp.simplify(combined)
+
+        if split_type == "General Additive Separability":
+            if g_inv_expr is not None:
+                t_sym = sp.Symbol(context.target_name, real=True)
+                fn_ginv = sp.lambdify(t_sym, g_inv_expr, 'numpy')
+                Z_val = np.asarray(fn_ginv(Y_val), dtype=float)
+            else:
+                Z_val = Y_val
+
+            A_mat = np.vstack([val_A, val_B, np.ones(N)]).T
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(A_mat, Z_val, rcond=None)
+                alpha_A, alpha_B, beta = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+            except Exception:
+                alpha_A, alpha_B, beta = 1.0, 1.0, 0.0
+
+            if abs(beta) / (np.ptp(Z_val) + 1e-9) < 1e-3:
+                beta = 0.0
+
+            snap_A = snap_number(alpha_A)
+            snap_B = snap_number(alpha_B)
+            snap_b = snap_number(beta)
+
+            s_expr = snap_A * e_A + snap_B * e_B + snap_b
+
+            if g_forward is not None and list(g_forward.free_symbols):
+                target_var = list(g_forward.free_symbols)[0]
+                return sp.simplify(g_forward.subs(target_var, s_expr))
+            return sp.simplify(s_expr)
+
+        raise ValueError(f"Unknown split: {split_type}")
+
+    def _compute_split_symbolic(
+        self, 
+        context: 'SymbolicRegressionContext', 
+        group_A: List[str], 
+        group_B: List[str], 
+        split_type: str, 
+        g_inv_expr: sp.Expr = None
+    ):
         target_name = context.target_name
-        y_original = context.df[target_name].values
-        n_samples = len(context.df)
-
-        pts_A = torch.tensor(context.df[feature_cols].values, dtype=torch.float64)
-        for col_name in group_B:
-            col_idx = feature_cols.index(col_name)
-            median_val = context.df[col_name].median()
-            pts_A[:, col_idx] = torch.full((n_samples,), median_val)
-
-        gp_model.model.eval()
-        gp_model.likelihood.eval()
-
-        with torch.no_grad():
-            predictions = gp_model.predict(pts_A)
-            y_A = predictions.mean.numpy()
-
         original_target_dim = context.registry.get_dim(target_name)
-        zero_dim_vector = [0.0] * len(original_target_dim.vector)
+        zero_dim = PhysicalDimension([0.0] * len(original_target_dim.vector))
 
-        if is_gas:
-            registry_temp = PhysicalRegistry()
-            registry_temp.register(target_name, original_target_dim.vector)
-            dim_target_A = DimensionalityEvaluator.evaluate(g_inv_expr, registry_temp)
+        if split_type == "General Additive Separability":
+            try:
+                reg_temp = PhysicalRegistry()
+                reg_temp.register(target_name, original_target_dim.vector)
+                dim_target_A = DimensionalityEvaluator.evaluate(g_inv_expr, reg_temp)
+            except DimensionalError: 
+                dim_target_A = zero_dim
             dim_target_B = dim_target_A
+
         elif split_type == "Multiplicative Separability":
-            dim_target_A = original_target_dim
-            dim_target_B = PhysicalDimension(zero_dim_vector)
-        elif split_type == "Additive Separability":
-            dim_target_A = original_target_dim
-            dim_target_B = original_target_dim
+            M_A = context.registry.build_matrix_numpy(group_A)
+            M_B = context.registry.build_matrix_numpy(group_B) if group_B else np.zeros((len(original_target_dim.vector), 1))
+            dim_Y = original_target_dim.vector
 
-        shift_const = np.median(y_A) if split_type == "Additive Separability" else 0.0
+            D_A_vec, D_B_vec = DimensionalProjector.resolve_multiplicative_split(dim_Y, M_A, M_B)
 
-        df_A = context.df[group_A].copy()
-        if is_gas:
-            target_sym = sp.Symbol(target_name)
-            f_g_inv = sp.lambdify([target_sym], g_inv_expr, 'numpy')
-            df_A[target_name] = f_g_inv(y_A)
-        elif split_type == "Additive Separability":
-            df_A[target_name] = y_A - shift_const
-        else:
-            df_A[target_name] = y_A
-
-        registry_A = PhysicalRegistry()
-        registry_A.register(target_name, dim_target_A.vector)
-        for col in group_A:
-            registry_A.register(col, context.registry.get_dim(col).vector)
-
-        mapping_A = {col: context.symbolic_mapping[col] for col in group_A}
-        context_A = SymbolicRegressionContext(df_A, registry_A, target_name, mapping_A, context.target_expr)
-
-        df_B = context.df[group_B].copy()
-        if is_gas:
-            target_sym = sp.Symbol(target_name)
-            f_g_inv = sp.lambdify([target_sym], g_inv_expr, 'numpy')
-            df_B[target_name] = f_g_inv(y_original) - f_g_inv(y_A)
-        elif split_type == "Additive Separability":
-            df_B[target_name] = (y_original - y_A) + shift_const
-        elif split_type == "Multiplicative Separability":
-            y_A_safe = np.copysign(np.maximum(np.abs(y_A), 1e-4), y_A)
-            df_B[target_name] = np.clip(y_original / y_A_safe, -1e5, 1e5)
-
-        registry_B = PhysicalRegistry()
-        registry_B.register(target_name, dim_target_B.vector)
-        for col in group_B:
-            registry_B.register(col, context.registry.get_dim(col).vector)
-
-        mapping_B = {col: context.symbolic_mapping[col] for col in group_B}
-        context_B = SymbolicRegressionContext(df_B, registry_B, target_name, mapping_B, context.target_expr)
-
-        return context_A, context_B
-        
-class SymmetryPreprocessingStep(PipelineStep):
-    def __init__(self, gp_config: 'GPConfig', verbose: bool = True,
-                 optimize_constants: bool = True, allowed_constants: list = [1.0, 2.0],
-                 allowed_ops: list = ["add", "sub", "mul", "div", "sin", "cos", "exp", "log"],
-                 active_simplifiers: list = ["translational", "addition", "largescale", "multiply", "generalized"]):
-        self.gp_config = gp_config
-        self.verbose = verbose
-        self.optimize_constants = optimize_constants
-        self.allowed_constants = allowed_constants
-        self.allowed_ops = allowed_ops
-        self.active_simplifiers = active_simplifiers
-
-    def train_gp(self, dataset: pd.DataFrame, target_name: str, config: GPConfig) -> GPRegressionPipeline:
-        feature_cols = [col for col in dataset.columns if col != target_name]
-        train_x = torch.tensor(dataset[feature_cols].values, dtype=torch.float64)
-        train_y = torch.tensor(dataset[target_name].values, dtype=torch.float64)
-        pipeline = GPRegressionPipeline(config)
-        loss_history = pipeline.fit(train_x, train_y)
-        return pipeline, loss_history
-
-    def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
-        if self.verbose:
-            print("\n" + "="*60)
-            print("[SymmetryPreprocessingStep][ЗАПУСК] Перманентное сжатие признаков")
-            print(f"Переменные на входе: {context.get_active_features()}")
-            print("="*60)
-
-        working_context = context.copy()
-
-        simplifier_map = {
-            "translational": lambda: TranslationalSymmetrySimplifier(),
-            "addition": lambda: AdditionSymmetrySimplifier(),
-            "largescale": lambda: LargeScaleSymmetrySimplifier(),
-            "multiply": lambda: MultiplySymmetrySimplifier(),
-            "generalized": lambda: GeneralizedSymmetrySimplifier(),
-            "compositionality": lambda: CompositionalitySimplifier(
-                optimize_constants=self.optimize_constants,
-                allowed_constants=self.allowed_constants,
-                allowed_ops=self.allowed_ops
-            )
-        }
-
-        active_simplifiers = []
-        for key in self.active_simplifiers:
-            if key in simplifier_map:
-                active_simplifiers.append(simplifier_map[key]())
-            else:
-                print(f"[Warning] Unknown simplifier key for preprocessing: '{key}'")
-
-        while len(working_context.get_active_features()) > 1:
-            gp_model, loss_history = self.train_gp(working_context.df, working_context.target_name, self.gp_config)
-            current_loss = loss_history[-1] if loss_history else 1e5
-            current_noise = gp_model.likelihood.noise.item()
-
-            found_any = False
-
-            for simplifier in active_simplifiers:
-                success, result = simplifier.try_simplify(gp_model, working_context)
-                if success:
-                    if self.verbose:
-                        print(f"[Предобработка] Сжатие по симметрии: {simplifier.name} -> {result}")
-                    
-                    collapsed = self._collapse_context_variables(
-                        working_context, result, simplifier.name, gp_model
-                    )
-                    if collapsed is not None:
-                        test_gp, test_loss_history = self.train_gp(
-                            collapsed.df, collapsed.target_name, self.gp_config
-                        )
-                        test_loss = test_loss_history[-1] if test_loss_history else 1e5
-                        test_noise = test_gp.likelihood.noise.item()
-                        if test_loss > current_loss + 0.35:
-                            if self.verbose:
-                                print(f"[Предобработка] ОТКАТ: Сжатие по {simplifier.name} отклонено. "
-                                    f"Модель деградировала (Loss: {current_loss:.4f} -> {test_loss:.4f}, "
-                                    f"Noise: {current_noise:.4f} -> {test_noise:.4f})")
-                            continue
-                        working_context = collapsed
-                        found_any = True
-                        break  
-                    else:
-                        if self.verbose:
-                            print(f"[Предобработка] Свертка по {simplifier.name} вернула None. Переход к следующему упростителю.")
-
-            if not found_any:
-                break  
-
-        if self.verbose:
-            print(f"Сжатие завершено. Переменные на выходе: {working_context.get_active_features()}")
-            print("="*60 + "\n")
-
-        return working_context
-
-    def _collapse_context_variables(self, context: 'SymbolicRegressionContext', result, 
-                                    split_type: str, gp_model) -> 'SymbolicRegressionContext':
-        new_context = context.copy()
-        df_mutated = new_context.df
-
-        if split_type in ["Translational Symmetry", "LargeScale Symmetry", "Multiply Symmetry", "Addition Symmetry"]:
-            if isinstance(result[0], list):
-                group = next(g for g in result if len(g) >= 2)
-            else:
-                group = result
-
-            x1_name, x2_name = group[0], group[1]
-            s1, s2 = sp.Symbol(x1_name), sp.Symbol(x2_name)
-
-            if split_type == "Translational Symmetry":
-                new_col_name = f"({x1_name}_minus_{x2_name})"
-                h_expr = s1 - s2
-                df_mutated[new_col_name] = df_mutated[x1_name] - df_mutated[x2_name]
-            elif split_type == "Addition Symmetry": 
-                new_col_name = f"({x1_name}_plus_{x2_name})"
-                h_expr = s1 + s2
-                df_mutated[new_col_name] = df_mutated[x1_name] + df_mutated[x2_name]
-            elif split_type == "LargeScale Symmetry":
-                new_col_name = f"({x1_name}_div_{x2_name})"
-                h_expr = s1 / s2
-                df_mutated[new_col_name] = df_mutated[x1_name] / (df_mutated[x2_name] + 1e-19)
-            elif split_type == "Multiply Symmetry":
-                new_col_name = f"({x1_name}_mul_{x2_name})"
-                h_expr = s1 * s2
-                df_mutated[new_col_name] = df_mutated[x1_name] * df_mutated[x2_name]
-
-            df_mutated.drop(columns=[x1_name, x2_name], inplace=True)
-
-            new_dim = DimensionalityEvaluator.evaluate(h_expr, context.registry)
-            new_context.register_mutation([x1_name, x2_name], new_col_name, h_expr, new_dim)
-
-        elif split_type == "Compositionality":
-            if isinstance(result, tuple):
-                h_expr = result[0]
-            else:
-                h_expr = result
-
-            symbols = sorted(list(h_expr.free_symbols), key=lambda s: s.name)
-            involved_vars = [sym.name for sym in symbols]
-            f_h = sp.lambdify(symbols, h_expr, 'numpy')
-            args = [df_mutated[name].values for name in involved_vars]
-            new_col_name = f"({str(h_expr)})"
-            df_mutated[new_col_name] = f_h(*args)
-            df_mutated.drop(columns=involved_vars, inplace=True)
-
-            new_dim = DimensionalityEvaluator.evaluate(h_expr, context.registry)
-            new_context.register_mutation(involved_vars, new_col_name, h_expr, new_dim)
-
-        elif split_type == "Generalized Symmetry":
-            group = result 
             if self.verbose:
-                print(f"Запуск локального поиска формулы связи для группы {group}...")
-            
-            h_expr = find_best_h_for_group(
-                gp_model, context, group, 
-                local_bf_max_length=self.local_bf_max_length, 
-                optimize_constants=self.optimize_constants, 
-                allowed_constants=self.allowed_constants,
-                allowed_ops=self.allowed_ops,
-                k_best=self.k_best 
-            )
-            if h_expr is None:
-                return None
-            
-            return self._collapse_context_variables(context, h_expr, "Compositionality", gp_model)
+                logger.info(
+                    f"[DimensionalProjector] Мультипликативное распределение размерностей:\n"
+                    f"  -> Исходный таргет {target_name}: {original_target_dim}\n"
+                    f"  -> Блок A {group_A} таргет: PhysicalDimension({list(D_A_vec)})\n"
+                    f"  -> Блок B {group_B} таргет: PhysicalDimension({list(D_B_vec)})"
+                )
 
-        return new_context
-        
-        
-class GPHyperparameterTuningStep(PipelineStep):
-    def __init__(self, gp_config: GPConfig, cache_path: str = "gp_best_params.json",
-                 force_tune: bool = False, n_trials: int = 40, subsample_size: Optional[int] = None,
-                 gamma: float = 0.01, verbose: bool = True,
-                 fixed_optimizer: Optional[Any] = None,
-                 fixed_kernel_type: Optional[Any] = None,
-                 fixed_mean_type: Optional[Any] = None,
-                 fixed_loss_type: Optional[Any] = None,
-                 fixed_lr: Optional[float] = None,
-                 loss_modifier: Optional[Callable] = None):
-        self.gp_config = gp_config
-        self.cache_path = cache_path
-        self.force_tune = force_tune
-        self.n_trials = n_trials
-        self.subsample_size = subsample_size
-        self.gamma = gamma
-        self.verbose = verbose
-
-        self.fixed_optimizer = fixed_optimizer
-        self.fixed_kernel_type = fixed_kernel_type
-        self.fixed_mean_type = fixed_mean_type
-        self.fixed_loss_type = fixed_loss_type
-        self.fixed_lr = fixed_lr
-        self.loss_modifier = loss_modifier
-
-    def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
-        if not self.force_tune and os.path.exists(self.cache_path):
-            if self.verbose:
-                print(f"[Tuning] Найден кэш параметров в '{self.cache_path}'. Загрузка...")
-            self._load_and_apply_params()
-            return context
-        
-        if self.verbose:
-            print("\n" + "="*60)
-            print("[Tuning][ЗАПУСК] Поиск оптимальных гиперпараметров GP (Optuna)")
-            print(f"Зафиксированные параметры (без подбора):")
-            if self.fixed_optimizer is not None: print(f"  - optimizer: {self.fixed_optimizer}")
-            if self.fixed_kernel_type is not None: print(f"  - kernel_type: {self.fixed_kernel_type}")
-            if self.fixed_mean_type is not None: print(f"  - mean_type: {self.fixed_mean_type}")
-            if self.fixed_loss_type is not None: print(f"  - loss_type: {self.fixed_loss_type}")
-            if self.fixed_lr is not None: print(f"  - lr: {self.fixed_lr}")
-            if self.loss_modifier is not None: print(f"  - loss_modifier: {self.loss_modifier.__name__ if hasattr(self.loss_modifier, '__name__') else 'Custom Callable'}")
-            print("="*60)
-
-        feature_cols = context.get_active_features()
-        if self.subsample_size is not None and len(context.df) > self.subsample_size:
-            df_sub = context.df.sample(n=self.subsample_size, random_state=42)
+            dim_target_A = PhysicalDimension(D_A_vec)
+            dim_target_B = PhysicalDimension(D_B_vec)
         else:
-            df_sub = context.df
+            dim_target_A, dim_target_B = original_target_dim, original_target_dim
 
-        X_np = df_sub[feature_cols].values
-        Y_np = df_sub[context.target_name].values
+        reg_A, reg_B = PhysicalRegistry(), PhysicalRegistry()
+        reg_A.register(target_name, dim_target_A.vector)
+        reg_B.register(target_name, dim_target_B.vector)
 
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        sampler = optuna.samplers.TPESampler(multivariate=True, seed=42)
+        for col in group_A: 
+            reg_A.register(col, context.registry.get_dim(col).vector)
+        for col in group_B: 
+            reg_B.register(col, context.registry.get_dim(col).vector)
 
-        study = optuna.create_study(
-            direction="minimize",
-            sampler=sampler, 
-            pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=45)
+        map_A = {c: context.symbolic_mapping[c] for c in group_A}
+        map_B = {c: context.symbolic_mapping[c] for c in group_B}
+
+        return reg_A, reg_B, map_A, map_B
+
+    def _split_context(
+        self,
+        context,
+        groups,
+        gp_model,
+        split_type,
+        g_inv_expr=None,
+    ):
+        df_A, df_B, grp_A, grp_B = self._compute_split_numerical(
+            context,
+            groups,
+            gp_model,
+            split_type,
+            g_inv_expr=g_inv_expr,
         )
-        study.optimize(lambda trial: self._objective(trial, X_np, Y_np), n_trials=self.n_trials)
 
-        best_params = study.best_params.copy()
-        
-        if self.fixed_optimizer is not None: best_params["optimizer"] = self.fixed_optimizer
-        if self.fixed_kernel_type is not None: best_params["kernel_type"] = self.fixed_kernel_type
-        if self.fixed_mean_type is not None: best_params["mean_type"] = self.fixed_mean_type
-        if self.fixed_loss_type is not None: best_params["loss_type"] = self.fixed_loss_type
-        if self.fixed_lr is not None: best_params["lr"] = self.fixed_lr
+        reg_A, reg_B, map_A, map_B = self._compute_split_symbolic(
+            context,
+            grp_A,
+            grp_B,
+            split_type,
+            g_inv_expr=g_inv_expr,
+        )
 
-        if self.verbose:
-            print("\n" + "="*50)
-            print("[Tuning] Оптимизация завершена!")
-            print(f"Лучший скор (CV 1-R2 + Penalty): {study.best_value:.5f}")
-            print("Итоговые подобранные параметры:")
-            for k, v in best_params.items():
-                print(f"  {k}: {v}")
-            print("="*50 + "\n")
-
-        json_save_dict = {}
-        for k, v in best_params.items():
-            if isinstance(v, (int, float, str, bool, list, dict)) or v is None:
-                json_save_dict[k] = v
-            else:
-                json_save_dict[k] = str(v)
-
-        with open(self.cache_path, "w") as f:
-            json.dump(json_save_dict, f, indent=4)
-
-        self._apply_params(best_params)
-        return context
-
-    def _objective(self, trial, X_np, Y_np) -> float:
-        optimizer_name = self.fixed_optimizer if self.fixed_optimizer is not None \
-            else trial.suggest_categorical("optimizer", ["adam", "lbfgs"])
-            
-        kernel_type = self.fixed_kernel_type if self.fixed_kernel_type is not None \
-            else trial.suggest_categorical("kernel_type", [
-                "rbf", "matern_32", "matern_52", "rq", "periodic", "cosine", "spectral_mixture", "cauchy"
-            ])
-            
-        mean_type = self.fixed_mean_type if self.fixed_mean_type is not None \
-            else trial.suggest_categorical("mean_type", ["constant", "zero"])
-            
-        loss_type = self.fixed_loss_type if self.fixed_loss_type is not None \
-            else trial.suggest_categorical("loss_type", ["mll", "loo"])
-
-        if self.fixed_lr is not None:
-            lr = self.fixed_lr
-        elif optimizer_name == "adam":
-            lr = trial.suggest_float("adam_lr", 1e-3, 0.1, log=True)
-        else:
-            lr = 1.0
-
-        trial_config = GPConfig(
-            model=ModelConfig(
-                mean_type=mean_type,
-                kernel=KernelConfig(type=kernel_type, scale_kernel=True, ard=True)
+        return (
+            SymbolicRegressionContext(
+                df_A,
+                reg_A,
+                context.target_name,
+                map_A,
+                context.target_expr,
             ),
-            training=TrainingConfig(
-                lr=lr,
-                epochs=500, 
-                early_stopping_patience=100,
-                optimizer=optimizer_name,
-                loss_type=loss_type,
-                verbose=False,
-                loss_modifier=self.loss_modifier 
-            )
+            SymbolicRegressionContext(
+                df_B,
+                reg_B,
+                context.target_name,
+                map_B,
+                context.target_expr,
+            ),
         )
 
-        kf = KFold(n_splits=3, shuffle=True, random_state=42)
-        scores = []
-
-        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X_np)):
-            X_tr, X_val = torch.tensor(X_np[train_idx], dtype=torch.float64), torch.tensor(X_np[val_idx], dtype=torch.float64)
-            Y_tr, Y_val = torch.tensor(Y_np[train_idx], dtype=torch.float64), torch.tensor(Y_np[val_idx], dtype=torch.float64)
-
-            pipeline = GPRegressionPipeline(trial_config)
-            try:
-                current_trial = trial if fold_idx == 0 else None
-                pipeline.fit(X_tr, Y_tr, trial=current_trial)
-                
-                pipeline.model.eval()
-                pipeline.likelihood.eval()
-                with torch.no_grad():
-                    pred_dist = pipeline.predict(X_val)
-                    pred_mean = pred_dist.mean.numpy()
-            except optuna.TrialPruned:
-                raise
-            except Exception:
-                return 1e5
-            
-            with torch.no_grad():
-                y_val_np = Y_val.numpy()
-                ss_res = np.sum((y_val_np - pred_mean) ** 2)
-                ss_tot = np.sum((y_val_np - np.mean(y_val_np)) ** 2)
-                r2 = 1.0 - (ss_res / (ss_tot + 1e-9))
-                r2 = max(r2, -2.0)
-
-            x_grid = X_tr.clone().detach().requires_grad_(True)
-
-            try:
-                mean_grid = pipeline.model(x_grid).mean
-
-                grad_outputs = torch.ones_like(mean_grid)
-                grads = torch.autograd.grad(
-                    outputs=mean_grid,
-                    inputs=x_grid,
-                    grad_outputs=grad_outputs,
-                    create_graph=True,
-                    retain_graph=True
-                )[0]
-
-                hessian_sum = 0.0
-                for d in range(x_grid.shape[1]):
-                    grad_d = grads[:, d]
-                    grad_grad_d = torch.autograd.grad(
-                        outputs=grad_d,
-                        inputs=x_grid,
-                        grad_outputs=torch.ones_like(grad_d),
-                        create_graph=True,
-                        retain_graph=True,
-                        allow_unused=True
-                    )[0]
-                    if grad_grad_d is not None:
-                        hessian_sum += torch.mean(grad_grad_d[:, d] ** 2)
-                penalty = hessian_sum.item()
-            except Exception:
-                penalty = 1e3
-
-            score = (1.0 - r2) + self.gamma * penalty
-            
-            if np.isnan(score) or np.isinf(score):
-                return 1e5
-                
-            scores.append(score)
-
-        return float(np.mean(scores))  
-     
-    def _apply_params(self, params: dict):
-        optimizer_name = params["optimizer"]
-        self.gp_config.training.optimizer = optimizer_name
+    def _compute_collapse_numerical(self, context: 'SymbolicRegressionContext', h_expr: sp.Expr):
+        df_mut = context.df.copy()
+        symbols = sorted(list(h_expr.free_symbols), key=lambda s: s.name)
+        vars_in = [s.name for s in symbols]
         
-        if optimizer_name == "adam":
-            self.gp_config.training.lr = params.get("adam_lr", params.get("lr", 0.05))
-            self.gp_config.training.early_stopping_patience = params.get(
-                "adam_patience", params.get("early_stopping_patience", 200)
+        f_h = sp.lambdify(symbols, h_expr, 'numpy')
+        new_col = f"({str(h_expr)})"
+        df_mut[new_col] = f_h(*[df_mut[n].values for n in vars_in])
+        df_mut.drop(columns=vars_in, inplace=True)
+        return df_mut, new_col, vars_in
+
+    def _collapse_context_variables(self, context: 'SymbolicRegressionContext', result):
+        h_expr = result[0] if isinstance(result, tuple) else result
+        new_context = context.copy()
+        
+        df_mut, new_col, vars_in = self._compute_collapse_numerical(context, h_expr)
+        new_dim = DimensionalityEvaluator.evaluate(h_expr, context.registry)
+        
+        new_context.df = df_mut
+        new_context.register_mutation(vars_in, new_col, h_expr, new_dim)
+        return new_context, new_col, h_expr
+
+    def _evaluate_and_apply_simplifier(self, simplifier, context, gp_model, k_sig, cur_loss, depth):
+        success, res = simplifier.try_simplify(gp_model, context, k_sigma=k_sig)
+        if not success: return False, None, None
+
+        if self.verbose: logger.info(f"[{simplifier.name}] Выдвинута гипотеза: {res}")
+
+        if simplifier.name in [
+            "Additive Separability",
+            "Multiplicative Separability",
+            "General Additive Separability"
+        ]:
+
+
+            if simplifier.name == "General Additive Separability":
+                groups = res[0]
+                g_fwd = res[1]
+                g_inv = res[2]
+            else:
+                groups = res
+                g_fwd = None
+                g_inv = None
+
+            if not isinstance(groups, (list, tuple)) or len(groups) < 2:
+                if self.verbose:
+                    logger.warning(
+                        f"[{simplifier.name}] Некорректный split: {groups}"
+                    )
+                return False, None, None
+
+            if any(not isinstance(group, (list, tuple)) for group in groups):
+                if self.verbose:
+                    logger.warning(
+                        f"[{simplifier.name}] Некорректная структура групп: {groups}"
+                    )
+                return False, None, None
+
+            ctx_A, ctx_B = self._split_context(
+                context,
+                groups,
+                gp_model,
+                simplifier.name,
+                g_inv_expr=g_inv,
             )
+
+            _, h_A = train_gp_on_dataframe(ctx_A.df, ctx_A.target_name, self.pipeline_config.gp_config)
+            _, h_B = train_gp_on_dataframe(ctx_B.df, ctx_B.target_name, self.pipeline_config.gp_config)
+            max_loss = max(h_A[-1] if h_A else 1e5, h_B[-1] if h_B else 1e5)
+            d_loss = max_loss - cur_loss
+
+            if self.verbose:
+                logger.info(f"[{simplifier.name}] Сравнение лоссов: Original={cur_loss:.4f} | Блок A={h_A[-1] if h_A else 1e5:.4f} | Блок B={h_B[-1] if h_B else 1e5:.4f} | Деградация: {d_loss:.4f}")
+
+            if d_loss <= self.config.loss_degradation_tolerance:
+                if self.verbose: logger.info(f"[{simplifier.name}] ПРИНЯТО (Деградация {d_loss:.4f} <= {self.config.loss_degradation_tolerance})")
+                form_A = self._recursive_solve(ctx_A, depth + 1)
+                form_B = self._recursive_solve(ctx_B, depth + 1)
+                context.symbolic_mapping.update(ctx_A.symbolic_mapping)
+                context.symbolic_mapping.update(ctx_B.symbolic_mapping)
+                return True, self.combine_formulas(context, form_A, form_B, simplifier.name, g_fwd, g_inv_expr=g_inv), None
+            else:
+                if self.verbose: logger.info(f"[{simplifier.name}] ОТКЛОНЕНО (Деградация лосса: +{d_loss:.4f} > Порог: {self.config.loss_degradation_tolerance})")
+                return False, None, {
+                    'delta_loss': d_loss, 
+                    'type': 'split', 
+                    'split_name': simplifier.name, 
+                    'context_A': ctx_A, 
+                    'context_B': ctx_B, 
+                    'g_forward': g_fwd,
+                    'c_shift': 0.0
+                }
         else:
-            self.gp_config.training.lr = 1.0
-            self.gp_config.training.early_stopping_patience = params.get(
-                "lbfgs_patience", params.get("early_stopping_patience", 200)
-            )
-            
-        self.gp_config.model.kernel.type = params["kernel_type"]
-        self.gp_config.model.mean_type = params["mean_type"] 
-        self.gp_config.training.loss_type = params["loss_type"]
+            ctx_mut, col, h_loc = self._collapse_context_variables(context, res)
+            _, h_mut = train_gp_on_dataframe(ctx_mut.df, ctx_mut.target_name, self.pipeline_config.gp_config)
+            d_loss = (h_mut[-1] if h_mut else 1e5) - cur_loss
 
-    def _load_and_apply_params(self):
-        with open(self.cache_path, "r") as f:
-            params = json.load(f)
-        self._apply_params(params)
+            if self.verbose: logger.info(f"[{simplifier.name}] Сравнение лоссов: Original={cur_loss:.4f} | Мутация={h_mut[-1] if h_mut else 1e5:.4f} | Деградация: {d_loss:.4f}")
 
+            if d_loss <= self.config.loss_degradation_tolerance:
+                if self.verbose: logger.info(f"[{simplifier.name}] ПРИНЯТО (Деградация {d_loss:.4f} <= {self.config.loss_degradation_tolerance})")
+                return True, self._recursive_solve(ctx_mut, depth + 1).subs(sp.Symbol(col), h_loc), None
+            else:
+                if self.verbose: logger.info(f"[{simplifier.name}] ОТКЛОНЕНО (Деградация лосса: +{d_loss:.4f} > Порог: {self.config.loss_degradation_tolerance})")
+                return False, None, {'delta_loss': d_loss, 'type': 'collapse', 'mutated_context': ctx_mut, 'new_col': col, 'h_expr_loc': h_loc, 'split_name': simplifier.name}
+
+    def _recursive_solve(self, context: 'SymbolicRegressionContext', current_depth: int) -> sp.Expr:
+        feats = context.get_active_features()
+        if len(feats) == 1 or (self.config.max_depth is not None and current_depth >= self.config.max_depth):
+            return self._brute_force_symbolic_search(context, self.config.final_bf_max_length)
+        
+        if self.verbose: logger.info(f"\n--- [Глубина {current_depth}] Обучение GP для переменных: {feats} ---")
+        gp_model, hist = train_gp_on_dataframe(context.df, context.target_name, self.pipeline_config.gp_config)
+        cur_loss = hist[-1] if hist else 1e5
+
+        simplifiers = [
+            AdditiveSeparabilitySimplifier(self.pipeline_config), 
+            MultiplicationSeparabilitySimplifier(self.pipeline_config),
+            GeneralAdditiveSeparabilitySimplifier(self.pipeline_config),
+            CompositionalitySimplifier(self.pipeline_config)
+        ]
+        
+        rej = []
+        for mult in ([1.0] if len(feats) <= 2 else self.config.k_sigma_multipliers):
+            k_sig = self.config.base_k_sigma * mult
+            for s in simplifiers:
+                success, form, rej_data = self._evaluate_and_apply_simplifier(s, context, gp_model, k_sig, cur_loss, current_depth)
+                if success: return form
+                if rej_data: rej.append(rej_data)
+
+        if rej:
+            best = min(rej, key=lambda x: x['delta_loss'])
+            if best['delta_loss'] <= 0.8:
+                if self.verbose: logger.info(f"\nПрименяем лучший fallback (Delta Loss: +{best['delta_loss']:.4f})")
+                if best['type'] == 'split':
+                    return self.combine_formulas(
+                        context,
+                        self._recursive_solve(best['context_A'], current_depth + 1),
+                        self._recursive_solve(best['context_B'], current_depth + 1),
+                        best['split_name'],
+                        best.get('g_forward')
+                    )
+                else:
+                    return self._recursive_solve(best['mutated_context'], current_depth + 1).subs(sp.Symbol(best['new_col']), best['h_expr_loc'])
+
+        if self.verbose: logger.info(f"[Рекурсия] Переход к финальному BF.")
+        return self._brute_force_symbolic_search(context, self.config.final_bf_max_length)
+    
 class BaselineGPStep(PipelineStep):
-    def __init__(self, gp_config: GPConfig, verbose: bool = True):
-        self.gp_config = gp_config
-        self.verbose = verbose
-        self.baseline_metrics: Optional[dict] = None
+    def __init__(self, config: PipelineConfig):
+        self.gp_config = config.gp_config
+        self.verbose = config.verbose
 
     def transform(self, context: 'SymbolicRegressionContext') -> 'SymbolicRegressionContext':
-        if self.verbose:
-            print("\n" + "="*60)
-            print("[BaselineGPStep][ЗАПУСК] Холостой запуск GP (Оценка базовой точности)")
-            print("="*60)
-
-        feature_cols = context.get_active_features()
-        target_name = context.target_name
-
-        train_x = torch.tensor(context.df[feature_cols].values, dtype=torch.float64)
-        train_y = torch.tensor(context.df[target_name].values, dtype=torch.float64)
-
-        pipeline = GPRegressionPipeline(self.gp_config)
-        pipeline.fit(train_x, train_y)
-
+        if self.verbose: 
+            logger.info("\n=== [ЗАПУСК] Холостой запуск GP (Оценка базовой точности) ===")
+            
+        pipeline, _ = train_gp_on_dataframe(context.df, context.target_name, self.gp_config)
+        features = context.get_active_features()
+        train_x = torch.tensor(context.df[features].values, dtype=torch.float64)
         pipeline.model.eval()
         pipeline.likelihood.eval()
 
         with torch.no_grad():
-            pred_dist = pipeline.predict(train_x)
-            y_pred = pred_dist.mean.numpy()
+            y_pred = pipeline.predict(train_x).mean.cpu().numpy()
 
-        y_true = train_y.numpy()
-
-        denom = np.where(np.abs(y_true) < 1e-9, 1e-9, y_true)
-        relative_errors = (np.abs(y_true - y_pred) / np.abs(denom)) * 100.0
-
-        spearman_res = spearmanr(y_true, y_pred)
-        spearman_val = float(spearman_res.statistic if hasattr(spearman_res, 'statistic') else spearman_res[0])
-        if np.isnan(spearman_val):
-            spearman_val = 0.0
-
+        y_true = context.df[context.target_name].values
         mse = float(np.mean((y_true - y_pred) ** 2))
-        rmse = float(np.sqrt(mse))
-        mae = float(np.mean(np.abs(y_true - y_pred)))
-        mre = float(np.mean(relative_errors))
-        mdre = float(np.median(relative_errors))
-
-        ss_res = np.sum((y_true - y_pred) ** 2)
-        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-        r2 = float(1.0 - (ss_res / (ss_tot + 1e-12)))
-
-        self.baseline_metrics = {
-            "mse": mse,
-            "rmse": rmse,
-            "mae": mae,
-            "r2": r2,
-            "spearman": spearman_val,
-            "mre": mre,
-            "mdre": mdre
-        }
+        r2 = float(1.0 - (np.sum((y_true - y_pred) ** 2) / (np.sum((y_true - np.mean(y_true)) ** 2) + 1e-12)))
 
         if self.verbose:
-            print(f"[Базовая GP модель ({target_name})]:")
-            print(f"   MSE       : {mse:.6e}")
-            print(f"   RMSE      : {rmse:.6e}")
-            print(f"   MAE       : {mae:.6e}")
-            print(f"   R²        : {r2:.6f}")
-            print(f"   Spearman  : {spearman_val:.6f}")
-            print(f"   Средняя относительная ошибка (MRE) : {mre:.4f}%")
-            print(f"   Медианная отн. ошибка (Median RE)  : {mdre:.4f}%")
-            print("="*60 + "\n")
+            log_msg = f"\n[Базовая GP модель ({context.target_name})]:\n"
+            log_msg += f"   Точность: MSE = {mse:.6e} | R² = {r2:.6f}\n"
+
+            try:
+                raw_noise = float(pipeline.likelihood.noise.item())
+                sy = float(pipeline.scale_y_factor.item()) if pipeline.scale_y_factor is not None else 1.0
+                phys_noise_std = np.sqrt(raw_noise) * sy
+                log_msg += f"   Шум измерения (Noise Variance): {raw_noise:.4e} (std в физ. ед.: {phys_noise_std:.4f})\n"
+            except Exception:
+                pass
+
+            try:
+                from GP.utils import format_kernel_summary
+                kernel_summary = format_kernel_summary(
+                    pipeline.model.covar_module,
+                    features,
+                    scale_x_factor=pipeline.scale_x_factor,
+                    scale_y_factor=pipeline.scale_y_factor
+                )
+                log_msg += kernel_summary + "\n"
+            except Exception as e:
+                log_msg += f"   (Не удалось извлечь параметры ядра: {e})\n"
+
+            log_msg += "===================================\n"
+            logger.info(log_msg)
 
         return context
-
-
-def run_baseline_gp(df: pd.DataFrame, target_name: str, gp_config: GPConfig, verbose: bool = True) -> dict:
-    feature_cols = [col for col in df.columns if col != target_name]
-    train_x = torch.tensor(df[feature_cols].values, dtype=torch.float64)
-    train_y = torch.tensor(df[target_name].values, dtype=torch.float64)
-
-    pipeline = GPRegressionPipeline(gp_config)
-    pipeline.fit(train_x, train_y)
-
-    pipeline.model.eval()
-    pipeline.likelihood.eval()
-
-    with torch.no_grad():
-        pred_dist = pipeline.predict(train_x)
-        y_pred = pred_dist.mean.numpy()
-
-    y_true = train_y.numpy()
-    denom = np.where(np.abs(y_true) < 1e-9, 1e-9, y_true)
-    relative_errors = (np.abs(y_true - y_pred) / np.abs(denom)) * 100.0
-
-    spearman_res = spearmanr(y_true, y_pred)
-    spearman_val = float(spearman_res.statistic if hasattr(spearman_res, 'statistic') else spearman_res[0])
-    if np.isnan(spearman_val):
-        spearman_val = 0.0
-
-    metrics = {
-        "mse": float(np.mean((y_true - y_pred) ** 2)),
-        "rmse": float(np.sqrt(np.mean((y_true - y_pred) ** 2))),
-        "mae": float(np.mean(np.abs(y_true - y_pred))),
-        "r2": float(1.0 - (np.sum((y_true - y_pred) ** 2) / (np.sum((y_true - np.mean(y_true)) ** 2) + 1e-12))),
-        "spearman": spearman_val,
-        "mre": float(np.mean(relative_errors)),
-        "mdre": float(np.median(relative_errors))
-    }
-
-    if verbose:
-        print("\n" + "="*60)
-        print(f"[Холостой запуск GP] Оценка базовой точности для '{target_name}':")
-        print(f"   MSE       : {metrics['mse']:.6e}")
-        print(f"   RMSE      : {metrics['rmse']:.6e}")
-        print(f"   MAE       : {metrics['mae']:.6e}")
-        print(f"   R²        : {metrics['r2']:.6f}")
-        print(f"   Spearman  : {metrics['spearman']:.6f}")
-        print(f"   MRE (%)   : {metrics['mre']:.4f}%")
-        print(f"   MdRE (%)  : {metrics['mdre']:.4f}%")
-        print("="*60 + "\n")
-
-    return metrics

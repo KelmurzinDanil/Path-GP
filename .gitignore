@@ -9,3 +9,4 @@ gp_best_params.json
 **/fast_symbolic/
 *.so
 *.pyc
+.vscode
